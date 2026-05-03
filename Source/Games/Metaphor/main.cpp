@@ -13,6 +13,7 @@
 
 enum class FramePhase
 {
+   DEPTH_PREPASS,
    OPAQUE_RENDERING,
    PARTICLES,
    POSTPROCESSING_AND_UI
@@ -85,12 +86,12 @@ M_INLINE float3 TransformPoint(const float4x4 m, const float3& b)
 namespace
 {
    float2 projection_jitters = {0, 0};
+   ShaderHashesList shader_hashes_tonemap;
    ShaderHashesList shader_hashes_merge_particles;
    ShaderHashesList shader_hashes_fxaa;
    ShaderHashesList shader_hashes_smaa_edge_detection;
    ShaderHashesList shader_hashes_smaa_weight_calculation;
    ShaderHashesList shader_hashes_smaa_blending;
-   ShaderHashesList shader_hashes_tonemap;
    ShaderHashesList shader_hashes_outline;
 } // namespace
 
@@ -517,6 +518,21 @@ public:
              render_target_views[2] &&
              render_target_views[3])
          {
+            // planar reflections are rendered with front face culling enabled on a separate thread/context
+            // so ignore those draw calls
+            {
+               com_ptr<ID3D11RasterizerState> rasterizer_state;
+               native_device_context->RSGetState(&rasterizer_state);
+               D3D11_RASTERIZER_DESC rd;
+               rasterizer_state->GetDesc(&rd);
+
+               if (rd.CullMode == D3D11_CULL_FRONT)
+               {
+                  return DrawOrDispatchOverrideType::None;
+               }
+            }
+
+            game_device_data.frame_phase = FramePhase::OPAQUE_RENDERING;
             game_device_data.draw_device_context = native_device_context;
 
             if (SrActive(device_data))
@@ -537,11 +553,11 @@ public:
 
                depthResource->QueryInterface(&game_device_data.depth_texture);
 
-               com_ptr<ID3D11Resource> renderTargetResource;
-               render_target_views[0]->GetResource(&renderTargetResource);
+               com_ptr<ID3D11Resource> render_target_resource;
+               render_target_views[0]->GetResource(&render_target_resource);
 
                com_ptr<ID3D11Texture2D> texture;
-               renderTargetResource->QueryInterface(&texture);
+               render_target_resource->QueryInterface(&texture);
 
                D3D11_TEXTURE2D_DESC target_desc;
                texture->GetDesc(&target_desc);
@@ -627,6 +643,78 @@ public:
                   native_device_context->ClearRenderTargetView(game_device_data.motion_vectors_rtv.get(), clear_value);
                }
             }
+         }
+         else if (game_device_data.draw_device_context_candidates.contains(native_device_context) && depth_stencil_view)
+         {
+            // apply jitter to depth pre-pass
+            com_ptr<ID3D11Buffer> transform_constant_buffer;
+            native_device_context->VSGetConstantBuffers(1, 1, &transform_constant_buffer);
+
+            com_ptr<ID3D11Buffer> ps_system_constant_buffer;
+            native_device_context->PSGetConstantBuffers(0, 1, &ps_system_constant_buffer);
+
+            com_ptr<ID3D11Resource> depth_stencil_resource;
+            depth_stencil_view->GetResource(&depth_stencil_resource);
+
+            com_ptr<ID3D11Texture2D> texture;
+            depth_stencil_resource->QueryInterface(&texture);
+
+            D3D11_TEXTURE2D_DESC target_desc;
+            texture->GetDesc(&target_desc);
+
+            if (transform_constant_buffer && ps_system_constant_buffer)
+            {
+               float4x4 inv_proj;
+               float4x4 proj;
+               float4x4 proj_with_jitter;
+
+               D3D11_BUFFER_DESC ps_system_constant_buffer_desc;
+               ps_system_constant_buffer->GetDesc(&ps_system_constant_buffer_desc);
+               if (ps_system_constant_buffer_desc.ByteWidth == 288)
+               {
+                  auto it = game_device_data.cbuffer_cache.find(ps_system_constant_buffer.get());
+                  if (it != game_device_data.cbuffer_cache.cend())
+                  {
+                     const GFD_PSCONST_SYSTEM* ps_const_system = (GFD_PSCONST_SYSTEM*)it->second.data();
+                     inv_proj = ps_const_system->mtxInvProj;
+                     proj = ps_const_system->mtxProj;
+                     proj_with_jitter = proj;
+
+                     proj_with_jitter.m02 -= 2.0f * projection_jitters.x / (float)target_desc.Width;
+                     proj_with_jitter.m12 += 2.0f * projection_jitters.y / (float)target_desc.Height;
+                  }
+                  else
+                  {
+                     return DrawOrDispatchOverrideType::None;
+                  }
+               }
+               else
+               {
+                  return DrawOrDispatchOverrideType::None;
+               }
+
+               D3D11_BUFFER_DESC transform_constant_buffer_desc;
+               transform_constant_buffer->GetDesc(&transform_constant_buffer_desc);
+               if (transform_constant_buffer_desc.ByteWidth == 256)
+               {
+                  {
+                     auto it = game_device_data.cbuffer_cache.find(transform_constant_buffer.get());
+                     if (it != game_device_data.cbuffer_cache.cend())
+                     {
+                        GFD_VSCONST_TRANSFORM vs_consts = *(GFD_VSCONST_TRANSFORM*)it->second.data();
+                        vs_consts.mtxLocalToWorldViewProj = proj_with_jitter * inv_proj * vs_consts.mtxLocalToWorldViewProj;
+                        vs_consts.mtxLocalToWorldViewProjPrev = proj_with_jitter * inv_proj * vs_consts.mtxLocalToWorldViewProjPrev;
+
+                        if (transform_constant_buffer)
+                        {
+                           native_device_context->UpdateSubresource(transform_constant_buffer.get(), 0, nullptr, &vs_consts, 0, 0);
+                        }
+                     }
+                  }
+               }
+            }
+
+            return DrawOrDispatchOverrideType::None;
          }
          else
          {
@@ -892,7 +980,8 @@ public:
             native_device_context->OMSetRenderTargets(6, updated_render_target_views, depth_stencil_view.get());
          }
       }
-      else if (original_shader_hashes.Contains(shader_hashes_merge_particles))
+      else if (game_device_data.frame_phase == FramePhase::PARTICLES &&
+               original_shader_hashes.Contains(shader_hashes_merge_particles))
       {
          // only apply sr when we have the necessary input resources
          if (SrActive(device_data) &&
@@ -925,9 +1014,9 @@ public:
             overrideType = DrawOrDispatchOverrideType::Replaced;
          }
       }
+
       if (SrActive(device_data) &&
-          (original_shader_hashes.Contains(shader_hashes_fxaa) ||
-             original_shader_hashes.Contains(shader_hashes_smaa_blending)))
+          original_shader_hashes.Contains(shader_hashes_fxaa))
       {
          com_ptr<ID3D11ShaderResourceView> srv;
          native_device_context->PSGetShaderResources(0, 1, &srv);
@@ -945,10 +1034,34 @@ public:
          return DrawOrDispatchOverrideType::Skip;
       }
       else if (SrActive(device_data) &&
-               (original_shader_hashes.Contains(shader_hashes_smaa_edge_detection) ||
-                  original_shader_hashes.Contains(shader_hashes_smaa_weight_calculation)))
+               original_shader_hashes.Contains(shader_hashes_smaa_blending))
       {
-         return DrawOrDispatchOverrideType::Skip;
+         com_ptr<ID3D11BlendState> blend_state;
+         native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
+         D3D11_BLEND_DESC blend_desc;
+         blend_state->GetDesc(&blend_desc);
+
+         // menus that overlay 3D models onto the scene always apply SMAA
+         // so we don't skip when alpha blending is enabled
+         // that's also why we don't skip SMAA edge detection and weight calculation
+         if (!blend_desc.RenderTarget[0].BlendEnable ||
+             blend_desc.RenderTarget[0].SrcBlend != D3D11_BLEND_SRC_ALPHA)
+         {
+            com_ptr<ID3D11ShaderResourceView> srv;
+            native_device_context->PSGetShaderResources(0, 1, &srv);
+            com_ptr<ID3D11RenderTargetView> rtv;
+            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+
+            com_ptr<ID3D11Resource> srv_resource;
+            srv->GetResource(&srv_resource);
+
+            com_ptr<ID3D11Resource> rtv_resource;
+            rtv->GetResource(&rtv_resource);
+
+            native_device_context->CopySubresourceRegion(rtv_resource.get(), 0, 0, 0, 0, srv_resource.get(), 0, nullptr);
+
+            return DrawOrDispatchOverrideType::Skip;
+         }
       }
 
       return overrideType;
@@ -1172,7 +1285,7 @@ public:
             game_device_data.depth_texture.reset();
             game_device_data.particle_texture.reset();
 
-            game_device_data.frame_phase = FramePhase::OPAQUE_RENDERING;
+            game_device_data.frame_phase = FramePhase::DEPTH_PREPASS;
 
             game_device_data.draw_device_context = nullptr;
             game_device_data.draw_device_context_candidates.clear();
@@ -1258,7 +1371,8 @@ public:
       }
 
       // early out we don't need any cbuffer values after opaque geometry has finished
-      if (game_device_data.frame_phase != FramePhase::OPAQUE_RENDERING)
+      if (game_device_data.frame_phase != FramePhase::DEPTH_PREPASS &&
+          game_device_data.frame_phase != FramePhase::OPAQUE_RENDERING)
       {
          return false;
       }
@@ -1350,11 +1464,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
       enable_samplers_upgrade = true;
 
-      shader_hashes_merge_particles.pixel_shaders.emplace(std::stoul("AC103037", nullptr, 16));
-      shader_hashes_merge_particles.pixel_shaders.emplace(std::stoul("CD84F54A", nullptr, 16));
-
       shader_hashes_tonemap.pixel_shaders.emplace(std::stoul("A7108284", nullptr, 16));
       shader_hashes_tonemap.pixel_shaders.emplace(std::stoul("C1787BC6", nullptr, 16));
+
+      shader_hashes_merge_particles.pixel_shaders.emplace(std::stoul("AC103037", nullptr, 16));
+      shader_hashes_merge_particles.pixel_shaders.emplace(std::stoul("CD84F54A", nullptr, 16));
 
       shader_hashes_fxaa.pixel_shaders.emplace(std::stoul("94D1203C", nullptr, 16));
 
