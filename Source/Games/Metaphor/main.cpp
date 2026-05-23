@@ -1235,6 +1235,8 @@ public:
                draw_data.output_color = game_device_data.resolve_texture.get();
                draw_data.motion_vectors = game_device_data.scaled_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.sr_depth_texture.get();
+               draw_data.render_width = game_device_data.render_resolution.x;
+               draw_data.render_height = game_device_data.render_resolution.y;
                draw_data.bias_mask = game_device_data.sr_particle_texture ? game_device_data.bias_mask.get() : nullptr;
                draw_data.pre_exposure = 0.0f;
                draw_data.jitter_x = game_device_data.sr_projection_jitters.x;
