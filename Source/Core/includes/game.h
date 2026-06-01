@@ -8,7 +8,7 @@ using namespace Shader;
 // Make sure all variables are default initialized.
 struct GameDeviceData
 {
-   // Empty by default
+   ManagedResources managed_resources;
 };
 
 struct GameInfo
