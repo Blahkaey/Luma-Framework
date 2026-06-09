@@ -21,9 +21,11 @@ namespace CB
 	{
         float2 CurrJitters;
         float2 PrevJitters;
-		float4x4 CameraSpaceToPreviousProjectedSpace;
-        float4x4 PreviousViewRotProjectionMatrix;
-        float4 PreviousCameraPosition;  // W is dummy
+		float4 ViewportSize;
+		row_major float4x4 CurrentViewInverseMatrix;
+		row_major float4x4 CurrentProjectionInverseMatrix;
+		row_major float4x4 CurrentViewProjectionInverseMatrix;
+        row_major float4x4 PreviousViewProjectionMatrix;
 	};
 }
 
