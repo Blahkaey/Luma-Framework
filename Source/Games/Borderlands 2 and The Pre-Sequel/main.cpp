@@ -8,6 +8,8 @@
 // - TONEMAP PS 0xD00AA2A7 (BL2) / 0xFCFE623E (TPS): scene fp16 + bloom + vignette + LUT + DOF -> 8-bit LDR.
 //   Replaced to recover HDR (DICE + paper-white); UI composites AFTER, on the LDR.
 // - FXAA PS 0x0D3001F6 (only when in-game AA on) -> replaced with SMAA ULTRA + optional RCAS.
+// - dgVoodoo 2.81.3 only: Scaleform stencil-mask repair for the item-card rolling price digits (state fix at
+//   draw time, no shader replacement; see kScaleformMaskFillHash2813).
 //
 // All SDR/gamma space. One HDR mod owns the swapchain -> only ONE Luma .addon, dgVoodoo & ReShade both 32-bit
 // (other ReShade addons that also hook the swapchain crash via dgVoodoo -> keep disabled in normal use).
@@ -43,6 +45,18 @@ static constexpr uint32_t kTonemapHashTPS = 0xFCFE623E; // The Pre-Sequel: same 
 static constexpr uint32_t kLumaBloomSlotBL2 = 5;
 static constexpr uint32_t kLumaBloomSlotTPS = 8;
 static constexpr uint32_t kLumaDoFSlot = 7;
+
+// dgVoodoo 2.81.3 Scaleform stencil-mask repair. The dropped-item card is a Scaleform rendered to an
+// offscreen texture; its price is a rolling "odometer" (per digit: a vertical 0-9 glyph strip clipped to a
+// one-digit window). Per digit the pass draws [mask rect: SolidColor PS, stencil WRITE, color writes off] ->
+// [2 strip segments: glyph PS] that must stencil-TEST against it — but 2.81.3 leaves stencil DISABLED on the
+// strip draws (trace-verified), so the full 0-9 columns leak across the card. Repair in OnDrawOrDispatch:
+// arm on a mask-submit draw, force a test-only stencil state on the immediately following strip draws, and
+// bind + clear a scratch stencil buffer when the pass has none. Keyed on the 2.81.3 hashes and gated on
+// "stencil disabled", so correctly-translated paths (2.84+ hashes differ anyway, and even 2.81.3 gets the
+// screen-space HUD odometers right) are never touched. Same Scaleform CSOs ship in TPS -> fix covers both.
+static constexpr uint32_t kScaleformMaskFillHash2813 = 0x9F8EA541;   // Scaleform SolidColor PS (o0 = const): a mask submit when drawn stencil-writing with color writes off
+static constexpr uint32_t kScaleformDigitGlyphHash2813 = 0x63898919; // Scaleform glyph PS the rolling digit strips draw with
 
 // User settings (persisted via ReShade config under the project name; loaded in LoadConfigs).
 static bool g_smaa_enable = true;
@@ -118,6 +132,32 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11UnorderedAccessView> uav_dof_blur_h, uav_dof_blur_out;
    ComPtr<ID3D11Buffer> cb_dof_blur_h, cb_dof_blur_v; // cb_dof_blur (b0): axis-step + sigma, per pass
    float dof_blur_radius = -1.f;                      // recreate the CBs when the DoF Radius slider changes
+
+   // dgVoodoo 2.81.3 Scaleform mask repair (see kScaleformMaskFillHash2813). Armed between a stencil-mask
+   // submit draw and the digit-strip draws that must test against it. dgVoodoo's own stencil handling is not
+   // trusted at all (its write target, ref, ops and buffer contents are unobservable): the mask draw is
+   // duplicated into a private scratch stencil with a known ALWAYS/REPLACE/ref=1 state, and strips with
+   // stencil enabled but the test neutered are re-drawn testing EQUAL/ref=1 against that scratch (stencil
+   // disabled = genuinely unmasked glyphs sharing the span, left alone).
+   bool scaleform_mask_armed = false;
+   ComPtr<ID3D11DepthStencilState> dss_scaleform_mask_write; // stencil write-only (ALWAYS + REPLACE), depth off
+   ComPtr<ID3D11DepthStencilState> dss_scaleform_mask_test;  // stencil test-only (EQUAL, no writes), depth off
+   ComPtr<ID3D11DepthStencilView> dsv_scaleform_mask_active; // scratch the current armed span's mask was duplicated into
+   // D24S8 scratch stencils cached per RT size: card-RT and screen-size mask spans interleave every frame, so
+   // a single last-size scratch would be recreated several times per frame
+   struct ScaleformMaskDS
+   {
+      uint32_t width = 0, height = 0;
+      ComPtr<ID3D11Texture2D> tex;
+      ComPtr<ID3D11DepthStencilView> dsv;
+   };
+   ScaleformMaskDS scaleform_mask_ds_cache[4];
+   uint32_t scaleform_mask_ds_next = 0; // round-robin replacement when the cache is full
+#if DEVELOPMENT
+   // Per-frame repair diagnostics, latched at Present and shown in the settings UI
+   uint32_t scaleform_dbg_mask_submits = 0, scaleform_dbg_mask_dupes = 0, scaleform_dbg_strips_seen = 0, scaleform_dbg_strips_wrapped = 0, scaleform_dbg_strips_tested_ok = 0, scaleform_dbg_strips_unmasked = 0;
+   uint32_t scaleform_dbg_mask_submits_last = 0, scaleform_dbg_mask_dupes_last = 0, scaleform_dbg_strips_seen_last = 0, scaleform_dbg_strips_wrapped_last = 0, scaleform_dbg_strips_tested_ok_last = 0, scaleform_dbg_strips_unmasked_last = 0;
+#endif
 };
 
 class Borderlands2 final : public Game
@@ -443,6 +483,14 @@ public:
          gd.tex_rcas_out.reset();
          gd.tex_rcas_out_rtv.reset();
          gd.srv_luma_bloom.reset();
+         gd.dss_scaleform_mask_write.reset();
+         gd.dss_scaleform_mask_test.reset();
+         gd.dsv_scaleform_mask_active.reset();
+         for (auto& slot : gd.scaleform_mask_ds_cache)
+         {
+            slot.dsv.reset();
+            slot.tex.reset();
+         }
       }
       delete device_data.game;
       device_data.game = nullptr;
@@ -630,6 +678,228 @@ public:
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       const bool is_tonemap = is_immediate && (original_shader_hashes.Contains(kTonemapHash, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kTonemapHash2813, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kTonemapHashTPS, reshade::api::shader_stage::pixel));
 
+      // dgVoodoo 2.81.3 Scaleform stencil-mask repair (see kScaleformMaskFillHash2813): re-apply the stencil
+      // TEST that 2.81.3 drops on the item card's rolling price digits. dgVoodoo's own stencil handling is not
+      // trusted at all (its write target, ref, ops and buffer contents are unobservable): the mask draw is
+      // duplicated into a private scratch stencil with a known ALWAYS/REPLACE/ref=1 state, and the strip draws
+      // that directly follow are re-drawn testing EQUAL/ref=1 against it. The armed span only covers glyph
+      // draws directly following a mask submit; within it, strips with an effective stencil test (working
+      // paths) and stencil-disabled glyphs (genuinely unmasked content) are left alone.
+      if (is_immediate && !is_custom_pass && (gd.scaleform_mask_armed || original_shader_hashes.Contains(kScaleformMaskFillHash2813, reshade::api::shader_stage::pixel)))
+      {
+         // A mask submit is the SolidColor PS drawn with color writes off + a stencil-writing state; the same
+         // shader with color writes on is a regular fill (which also ends any armed span, below).
+         bool mask_submit = false;
+         if (original_shader_hashes.Contains(kScaleformMaskFillHash2813, reshade::api::shader_stage::pixel))
+         {
+            ComPtr<ID3D11BlendState> blend_state;
+            FLOAT blend_factor[4];
+            UINT sample_mask = 0;
+            native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+            if (blend_state)
+            {
+               D3D11_BLEND_DESC bd;
+               blend_state->GetDesc(&bd);
+               if (bd.RenderTarget[0].RenderTargetWriteMask == 0)
+               {
+                  ComPtr<ID3D11DepthStencilState> ds_state;
+                  UINT stencil_ref = 0;
+                  native_device_context->OMGetDepthStencilState(ds_state.put(), &stencil_ref);
+                  if (ds_state)
+                  {
+                     D3D11_DEPTH_STENCIL_DESC dsd;
+                     ds_state->GetDesc(&dsd);
+                     mask_submit = dsd.StencilEnable != FALSE;
+                  }
+               }
+            }
+         }
+
+         if (mask_submit)
+         {
+            // Duplicate the mask draw into the scratch stencil: clear to 0, re-run the draw writing REPLACE/1
+            // wherever its geometry covers (color writes are already off in the bound blend state). The original
+            // mask draw then proceeds untouched; whatever 2.81.3 does with it no longer matters. Only arm when
+            // the duplicate actually lands, so the strips can never test against a stale scratch.
+            gd.scaleform_mask_armed = false;
+#if DEVELOPMENT
+            gd.scaleform_dbg_mask_submits++;
+#endif
+            ComPtr<ID3D11RenderTargetView> rtv;
+            ComPtr<ID3D11DepthStencilView> prev_dsv;
+            native_device_context->OMGetRenderTargets(1, rtv.put(), prev_dsv.put());
+            if (rtv && original_draw_dispatch_func != nullptr)
+            {
+               ComPtr<ID3D11Resource> rt_res;
+               rtv->GetResource(rt_res.put());
+               ComPtr<ID3D11Texture2D> rt_tex;
+               if (rt_res && SUCCEEDED(rt_res->QueryInterface(IID_PPV_ARGS(rt_tex.put()))))
+               {
+                  D3D11_TEXTURE2D_DESC rt_desc;
+                  rt_tex->GetDesc(&rt_desc);
+                  Borderlands2GameDeviceData::ScaleformMaskDS* scratch = nullptr;
+                  for (auto& slot : gd.scaleform_mask_ds_cache)
+                  {
+                     if (slot.dsv && slot.width == rt_desc.Width && slot.height == rt_desc.Height)
+                     {
+                        scratch = &slot;
+                        break;
+                     }
+                  }
+                  if (!scratch)
+                  {
+                     for (auto& slot : gd.scaleform_mask_ds_cache)
+                     {
+                        if (!slot.dsv)
+                        {
+                           scratch = &slot;
+                           break;
+                        }
+                     }
+                     if (!scratch)
+                        scratch = &gd.scaleform_mask_ds_cache[gd.scaleform_mask_ds_next++ % std::size(gd.scaleform_mask_ds_cache)];
+                     scratch->dsv.reset();
+                     scratch->tex.reset();
+                     D3D11_TEXTURE2D_DESC ds_desc = {};
+                     ds_desc.Width = rt_desc.Width;
+                     ds_desc.Height = rt_desc.Height;
+                     ds_desc.MipLevels = 1;
+                     ds_desc.ArraySize = 1;
+                     ds_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                     ds_desc.SampleDesc = rt_desc.SampleDesc;
+                     ds_desc.Usage = D3D11_USAGE_DEFAULT;
+                     ds_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+                     if (SUCCEEDED(native_device->CreateTexture2D(&ds_desc, nullptr, scratch->tex.put())))
+                        native_device->CreateDepthStencilView(scratch->tex.get(), nullptr, scratch->dsv.put());
+                     scratch->width = rt_desc.Width;
+                     scratch->height = rt_desc.Height;
+                  }
+                  if (!gd.dss_scaleform_mask_write)
+                  {
+                     D3D11_DEPTH_STENCIL_DESC write_desc = {};
+                     write_desc.DepthEnable = FALSE;
+                     write_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+                     write_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+                     write_desc.StencilEnable = TRUE;
+                     write_desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+                     write_desc.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+                     write_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+                     write_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                     write_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+                     write_desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+                     write_desc.BackFace = write_desc.FrontFace;
+                     native_device->CreateDepthStencilState(&write_desc, gd.dss_scaleform_mask_write.put());
+                  }
+                  if (scratch->dsv && gd.dss_scaleform_mask_write)
+                  {
+                     ComPtr<ID3D11DepthStencilState> prev_ds_state;
+                     UINT prev_stencil_ref = 0;
+                     native_device_context->OMGetDepthStencilState(prev_ds_state.put(), &prev_stencil_ref);
+                     native_device_context->ClearDepthStencilView(scratch->dsv.get(), D3D11_CLEAR_STENCIL, 1.f, 0);
+                     ID3D11RenderTargetView* rtv_raw = rtv.get();
+                     native_device_context->OMSetRenderTargets(1, &rtv_raw, scratch->dsv.get());
+                     native_device_context->OMSetDepthStencilState(gd.dss_scaleform_mask_write.get(), 1u);
+                     (*original_draw_dispatch_func)();
+                     native_device_context->OMSetDepthStencilState(prev_ds_state.get(), prev_stencil_ref);
+                     native_device_context->OMSetRenderTargets(1, &rtv_raw, prev_dsv.get());
+                     gd.dsv_scaleform_mask_active = scratch->dsv;
+                     gd.scaleform_mask_armed = true;
+#if DEVELOPMENT
+                     gd.scaleform_dbg_mask_dupes++;
+#endif
+                  }
+               }
+            }
+         }
+         else if (gd.scaleform_mask_armed && original_shader_hashes.Contains(kScaleformDigitGlyphHash2813, reshade::api::shader_stage::pixel))
+         {
+#if DEVELOPMENT
+            gd.scaleform_dbg_strips_seen++;
+#endif
+            // Strip segment inside an armed mask span. Only intervene on glyph draws whose stencil is ENABLED
+            // but with the test itself neutered (ALWAYS func / zero read mask / no stencil-capable DSV bound):
+            // 2.81.3 translates the StencilEnable flag faithfully and only breaks the test, so enabled+neutered
+            // is exactly the broken masked content, while StencilEnable FALSE means genuinely unmasked glyphs
+            // that merely share the span (e.g. the inventory navbar icon borders drawn right after a rolling
+            // digit group) - clipping those to the digit mask made them vanish while odometers animate. The
+            // effective-test logic mirrors the trace tooling's (see draw.hpp).
+            ComPtr<ID3D11DepthStencilState> prev_ds_state;
+            UINT prev_stencil_ref = 0;
+            native_device_context->OMGetDepthStencilState(prev_ds_state.put(), &prev_stencil_ref);
+            ComPtr<ID3D11RenderTargetView> rtv;
+            ComPtr<ID3D11DepthStencilView> prev_dsv;
+            native_device_context->OMGetRenderTargets(1, rtv.put(), prev_dsv.put());
+            D3D11_DEPTH_STENCIL_DESC dsd = {};
+            if (prev_ds_state)
+               prev_ds_state->GetDesc(&dsd);
+            const bool stencil_enabled = prev_ds_state && dsd.StencilEnable != FALSE;
+            bool effective_stencil_test = false;
+            if (stencil_enabled && prev_dsv)
+            {
+               D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+               prev_dsv->GetDesc(&dsv_desc);
+               const bool has_stencil_plane = dsv_desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || dsv_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+               const bool any_func_tests = dsd.FrontFace.StencilFunc != D3D11_COMPARISON_ALWAYS || dsd.BackFace.StencilFunc != D3D11_COMPARISON_ALWAYS;
+               effective_stencil_test = dsd.StencilReadMask != 0 && has_stencil_plane && any_func_tests;
+            }
+            if (!stencil_enabled)
+            {
+               // Unmasked glyph draw: leave it alone (the span stays armed for any masked strips after it)
+#if DEVELOPMENT
+               gd.scaleform_dbg_strips_unmasked++;
+#endif
+            }
+            else if (effective_stencil_test)
+            {
+               // Correctly translated path (e.g. the screen-space HUD odometers): leave it alone
+#if DEVELOPMENT
+               gd.scaleform_dbg_strips_tested_ok++;
+#endif
+            }
+            else if (original_draw_dispatch_func != nullptr && gd.dsv_scaleform_mask_active && rtv)
+            {
+               if (!gd.dss_scaleform_mask_test)
+               {
+                  // Test-only: pass exactly where the duplicated mask wrote 1, never write, depth off (matches
+                  // the strips' own state)
+                  D3D11_DEPTH_STENCIL_DESC test_desc = {};
+                  test_desc.DepthEnable = FALSE;
+                  test_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+                  test_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+                  test_desc.StencilEnable = TRUE;
+                  test_desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+                  test_desc.StencilWriteMask = 0;
+                  test_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+                  test_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                  test_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+                  test_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+                  test_desc.BackFace = test_desc.FrontFace;
+                  native_device->CreateDepthStencilState(&test_desc, gd.dss_scaleform_mask_test.put());
+               }
+               if (gd.dss_scaleform_mask_test)
+               {
+                  ID3D11RenderTargetView* rtv_raw = rtv.get();
+                  native_device_context->OMSetRenderTargets(1, &rtv_raw, gd.dsv_scaleform_mask_active.get());
+                  native_device_context->OMSetDepthStencilState(gd.dss_scaleform_mask_test.get(), 1u);
+                  (*original_draw_dispatch_func)();
+                  native_device_context->OMSetDepthStencilState(prev_ds_state.get(), prev_stencil_ref);
+                  native_device_context->OMSetRenderTargets(1, &rtv_raw, prev_dsv.get());
+#if DEVELOPMENT
+                  gd.scaleform_dbg_strips_wrapped++;
+#endif
+                  return DrawOrDispatchOverrideType::Replaced; // we ran the original draw ourselves (with the mask test wrapped around it)
+               }
+            }
+         }
+         else if (gd.scaleform_mask_armed)
+         {
+            // Any other draw ends the mask span (Scaleform pops the mask right after the strip segments).
+            // Bindings and states are restored around each wrapped draw above, so there is nothing to undo.
+            gd.scaleform_mask_armed = false;
+            gd.dsv_scaleform_mask_active.reset();
+         }
+      }
+
       // Track the LDR buffer (the tonemap's render target). The HUD draws onto it afterwards; the Hide UI
       // toggle uses this to recognize (and drop) those HUD draws.
       if (is_tonemap)
@@ -768,6 +1038,24 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
       gd.tonemap_fired_this_frame = false; // new frame: re-arm Hide UI's post-tonemap alpha-blend scope
+      // Never carry a Scaleform mask span across frames (a mask submit as the last draw of a frame would
+      // otherwise leave the repair armed for unrelated draws next frame)
+      gd.scaleform_mask_armed = false;
+      gd.dsv_scaleform_mask_active.reset();
+#if DEVELOPMENT
+      gd.scaleform_dbg_mask_submits_last = gd.scaleform_dbg_mask_submits;
+      gd.scaleform_dbg_mask_dupes_last = gd.scaleform_dbg_mask_dupes;
+      gd.scaleform_dbg_strips_seen_last = gd.scaleform_dbg_strips_seen;
+      gd.scaleform_dbg_strips_wrapped_last = gd.scaleform_dbg_strips_wrapped;
+      gd.scaleform_dbg_strips_tested_ok_last = gd.scaleform_dbg_strips_tested_ok;
+      gd.scaleform_dbg_strips_unmasked_last = gd.scaleform_dbg_strips_unmasked;
+      gd.scaleform_dbg_mask_submits = 0;
+      gd.scaleform_dbg_mask_dupes = 0;
+      gd.scaleform_dbg_strips_seen = 0;
+      gd.scaleform_dbg_strips_wrapped = 0;
+      gd.scaleform_dbg_strips_tested_ok = 0;
+      gd.scaleform_dbg_strips_unmasked = 0;
+#endif
    }
 
    void LoadConfigs() override
@@ -926,6 +1214,16 @@ public:
          reshade::set_config_value(nullptr, PROJECT_NAME, "HideUI", g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
+
+#if DEVELOPMENT
+      // Live per-frame counters for the dgVoodoo 2.81.3 Scaleform mask repair. With an item card on screen,
+      // expect submits == dupes and wrapped == seen (2 strips per digit); which counter stays at 0 tells
+      // which stage of the repair isn't engaging.
+      ImGui::SeparatorText("Scaleform Mask Repair (debug)");
+      const auto& gd = GetGameDeviceData(device_data);
+      ImGui::Text("Mask submits: %u (duplicated: %u)", gd.scaleform_dbg_mask_submits_last, gd.scaleform_dbg_mask_dupes_last);
+      ImGui::Text("Strip draws in span: %u (wrapped: %u, test already OK: %u, unmasked: %u)", gd.scaleform_dbg_strips_seen_last, gd.scaleform_dbg_strips_wrapped_last, gd.scaleform_dbg_strips_tested_ok_last, gd.scaleform_dbg_strips_unmasked_last);
+#endif
    }
 
    void PrintImGuiAbout() override
