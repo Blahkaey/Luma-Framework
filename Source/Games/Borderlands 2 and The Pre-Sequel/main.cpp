@@ -8,6 +8,9 @@
 // - TONEMAP PS 0xD00AA2A7 (BL2) / 0xFCFE623E (TPS): scene fp16 + bloom + vignette + LUT + DOF -> 8-bit LDR.
 //   Replaced to recover HDR (DICE + paper-white); UI composites AFTER, on the LDR.
 // - FXAA PS 0x0D3001F6 (only when in-game AA on) -> replaced with SMAA ULTRA + optional RCAS.
+// - AO (dgVoodoo 2.81.3 only): the game's SSAO occlusion PS 0x09C9AD0F -> replaced with the XeGTAO compute
+//   chain writing the same (AO, depth) buffer; the game's own depth-setup and apply passes stay vanilla and
+//   composite it (see kAOOcclusionHash2813).
 //
 // All SDR/gamma space. One HDR mod owns the swapchain -> only ONE Luma .addon, dgVoodoo & ReShade both 32-bit
 // (other ReShade addons that also hook the swapchain crash via dgVoodoo -> keep disabled in normal use).
@@ -55,6 +58,29 @@ static constexpr uint32_t kScaleformDigitGlyphHash2813 = 0x63898919;
 static constexpr uint32_t kScaleformMaskFillHash2873 = 0x616BEBBD;
 static constexpr uint32_t kScaleformDigitGlyphHash2873 = 0x79CDF7BA;
 
+// XeGTAO ambient occlusion (dgVoodoo 2.81.3 hashes; the 2.84 AO chain was never captured, so the feature is
+// inert under 2.84). The game's SSAO renders in 5 full-res passes: depth setup 0x48CA4E61 (scene alpha-depth
+// -> "buffer A" R32G32F (d, d), d = linear view Z normalized by 1/MaxOcclusionDepth, sky saturated to 1) ->
+// occlusion 0x09C9AD0F (buffer A -> "buffer B" R32G32F (AO, d)) -> 2x bilateral blur 0xBCB3A174 (B->A->B) ->
+// apply 0x89122ECA (buffer B onto the scene: discard at AO >= 0.995, else OcclusionColor by INV_SRC_ALPHA
+// blend). Luma replaces just the occlusion draw with 4 XeGTAO cs_5_0 dispatches (prefilter depth MIPs -> main
+// pass with depth-derived normals -> 2x denoise) and copies the result over buffer B (it has no UAV bind
+// flag); the blurs are skipped (XeGTAO denoises itself) and the depth setup + apply stay vanilla, so the game
+// composites our AO exactly like its own. The dispatches inherit the hijacked draw's own game constants
+// (dgVoodoo keeps SEPARATE per-stage cb4 buffers: PS cb4 = texel size + depth scale, VS cb4 = projection), so
+// FoV (incl. ADS zoom) and resolution are always live. Only engages when the game's AmbientOcclusion setting
+// is on (the chain doesn't render otherwise). No temporal history in the vanilla chain -> no ghosting risk.
+static constexpr uint32_t kAOOcclusionHash2813 = 0x09C9AD0F; // Gearbox HBAO-style occlusion PS -> hijacked by XeGTAO
+static constexpr uint32_t kAOBlurHash2813 = 0xBCB3A174;      // AO bilateral blur (x2 ping-pong) -> skipped when XeGTAO ran
+static constexpr uint32_t kAOApplyHash2813 = 0x89122ECA;     // AO composite onto the scene -> left vanilla (ends the skip span)
+static constexpr UINT kXeGTAODepthMipLevels = 5;             // prefiltered depth pyramid MIPs (fixed by the XeGTAO algorithm)
+static constexpr float kXeGTAORadiusFraction = 0.15f;        // AO radius as a fraction of view depth (matches the vanilla SSAO's ~0.13-0.27 * z behavior)
+static constexpr float kXeGTAORadiusFixed = 0.f;             // fixed AO radius term in game view units, added on top of the proportional one
+static constexpr float kXeGTAOFalloffRange = 0.615f;         // fraction of the radius over which occluders fade out (XeGTAO default 0.615)
+static constexpr float kXeGTAODistributionPower = 2.f;       // concentrates samples towards the center pixel (XeGTAO default 2)
+static constexpr float kXeGTAOThinOccluder = 0.f;            // thin occluder compensation (XeGTAO default 0)
+static constexpr float kXeGTAOFinalPower = 2.2f;             // AO contrast curve (XeGTAO default 2.2)
+
 // User settings (persisted via ReShade config under the project name; loaded in LoadConfigs).
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f;                                   // RCAS sharpen on SMAA output (0 = off)
@@ -67,6 +93,8 @@ static int g_bloom_nmips = 6;                                          // bloom 
 static float g_bloom_sigmas[6] = {1.5f, 2.0f, 2.0f, 2.0f, 1.0f, 1.0f}; // per-mip Gaussian sigma (tapered, wider middle for a soft natural halo)
 static int g_dof_type = 0;                                             // DoF path (live): 0 = vanilla game DoF (default), 1 = Luma separable Gaussian (UI checkbox)
 static float g_dof_radius = 9.f;                                       // DoF strength (full-res px @ 4K Gaussian blur extent). Default, users tune
+static bool g_xegtao_enable = true;                                    // replace the game's SSAO with XeGTAO (only engages when the game's AO setting is on)
+static float g_xegtao_intensity = 1.f;                                 // AO strength: lerp(1, AO, intensity) at the final denoise (1 = XeGTAO default)
 
 struct Borderlands2GameDeviceData final : public GameDeviceData
 {
@@ -145,6 +173,24 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    };
    ScaleformMaskDS scaleform_mask_ds_cache[4];
    uint32_t scaleform_mask_ds_next = 0;
+
+   // XeGTAO working textures (see kAOOcclusionHash2813), cached per AO-buffer resolution. depths = prefiltered
+   // view-depth MIP pyramid; ao[2] = (AO, packed edges) working ping-pong; final = (AO, raw depth) in the game
+   // AO buffer's exact format, CopyResource'd over it (the game's AO buffers have no UAV bind flag).
+   ComPtr<ID3D11Texture2D> tex_xegtao_depths; // R32_FLOAT, kXeGTAODepthMipLevels mips
+   ComPtr<ID3D11UnorderedAccessView> uav_xegtao_depths[kXeGTAODepthMipLevels];
+   ComPtr<ID3D11ShaderResourceView> srv_xegtao_depths;
+   ComPtr<ID3D11Texture2D> tex_xegtao_ao[2]; // R8G8_UNORM
+   ComPtr<ID3D11UnorderedAccessView> uav_xegtao_ao[2];
+   ComPtr<ID3D11ShaderResourceView> srv_xegtao_ao[2];
+   ComPtr<ID3D11Texture2D> tex_xegtao_final; // R32G32_FLOAT, matching the game's AO buffer for CopyResource
+   ComPtr<ID3D11UnorderedAccessView> uav_xegtao_final;
+   uint32_t xegtao_w = 0, xegtao_h = 0;
+   ComPtr<ID3D11Buffer> cb_xegtao; // CS b2 = fixed AO tuning plus live intensity; recreated when intensity changes
+   float xegtao_params[8] = {};
+   // Set when the occlusion draw was replaced this frame: scopes the kAOBlurHash2813 skip to the game's AO
+   // chain (the blur CSO could serve other effects); cleared at the apply draw and every Present.
+   bool xegtao_fired_this_frame = false;
 };
 
 class Borderlands2 final : public Game
@@ -442,6 +488,21 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS DoF Gaussian Blur CS"),
          ShaderDefinition{"Luma_BL2TPS_DoFGaussian", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "dof_blur_cs"});
 
+      // XeGTAO quality (slice count), exposed in Advanced Settings like the BioShock Infinite port.
+      shader_defines_data.append_range(std::vector<ShaderDefineData>{
+         {"XE_GTAO_QUALITY", '2', true, false, "0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
+      });
+      // XeGTAO compute passes replacing the game's SSAO occlusion draw (see kAOOcclusionHash2813). The two
+      // denoise entries are the same function compiled with/without the final (AO, depth) buffer-B output.
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS XeGTAO Prefilter Depths CS"),
+         ShaderDefinition{"Luma_BL2TPS_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS XeGTAO Main Pass CS"),
+         ShaderDefinition{"Luma_BL2TPS_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS XeGTAO Denoise Pass 1 CS"),
+         ShaderDefinition{"Luma_BL2TPS_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS XeGTAO Denoise Pass 2 CS"),
+         ShaderDefinition{"Luma_BL2TPS_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+
       // The game's post passes use cb0..cb5; b12/b13 are free for Luma.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -491,6 +552,19 @@ public:
             slot.dsv.reset();
             slot.tex.reset();
          }
+         gd.tex_xegtao_depths.reset();
+         for (auto& uav : gd.uav_xegtao_depths)
+            uav.reset();
+         gd.srv_xegtao_depths.reset();
+         for (int i = 0; i < 2; i++)
+         {
+            gd.tex_xegtao_ao[i].reset();
+            gd.uav_xegtao_ao[i].reset();
+            gd.srv_xegtao_ao[i].reset();
+         }
+         gd.tex_xegtao_final.reset();
+         gd.uav_xegtao_final.reset();
+         gd.cb_xegtao.reset();
       }
       delete device_data.game;
       device_data.game = nullptr;
@@ -670,6 +744,184 @@ public:
       ctx->CSSetUnorderedAccessViews(0, 1, uav_null, nullptr);
 
       blur_state.Restore(ctx);
+   }
+
+   // XeGTAO: replace the game's SSAO occlusion draw (kAOOcclusionHash2813) with the 4-dispatch XeGTAO chain,
+   // publishing (AO, depth) into the game's AO output "buffer B" via CopyResource (it has no UAV bind flag).
+   // All inputs come from the hijacked draw's own bindings: PS t0 = depth "buffer A", PS cb4 + VS cb4 = game
+   // constants (texel size + depth scale, projection). Returns true when the draw was fully replaced; false =
+   // fall back to the vanilla AO pass this frame (missing shaders, unexpected state, or creation failure).
+   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, Borderlands2GameDeviceData& gd)
+   {
+      // Shader-readiness gate (async loader / dev live-reload).
+      ID3D11ComputeShader* cs_prefilter = device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS XeGTAO Prefilter Depths CS")].get();
+      ID3D11ComputeShader* cs_main = device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS XeGTAO Main Pass CS")].get();
+      ID3D11ComputeShader* cs_denoise1 = device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS XeGTAO Denoise Pass 1 CS")].get();
+      ID3D11ComputeShader* cs_denoise2 = device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS XeGTAO Denoise Pass 2 CS")].get();
+      if (!cs_prefilter || !cs_main || !cs_denoise1 || !cs_denoise2)
+         return false;
+
+      // The draw's RT is the AO output "buffer B" (R32G32F, full render res); our final texture must match it
+      // exactly for CopyResource. Any other state means the hash matched something unexpected -> stay vanilla.
+      ComPtr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+      if (!rtv)
+         return false;
+      ComPtr<ID3D11Resource> rt_res;
+      rtv->GetResource(rt_res.put());
+      ComPtr<ID3D11Texture2D> rt_tex;
+      if (!rt_res || FAILED(rt_res->QueryInterface(IID_PPV_ARGS(rt_tex.put()))))
+         return false;
+      D3D11_TEXTURE2D_DESC rt_desc = {};
+      rt_tex->GetDesc(&rt_desc);
+      if (rt_desc.Width == 0 || rt_desc.Height == 0 || rt_desc.Format != DXGI_FORMAT_R32G32_FLOAT || rt_desc.SampleDesc.Count != 1 || rt_desc.MipLevels != 1 || rt_desc.ArraySize != 1)
+         return false; // CopyResource needs an exact topology match with our 1-mip non-MSAA copy source; anything else = stay vanilla
+
+      // Depth "buffer A" (PS t0): (d, d), d = linear view Z normalized by 1/MaxOcclusionDepth, sky = 1.
+      ComPtr<ID3D11ShaderResourceView> srv_depth;
+      native_device_context->PSGetShaderResources(0, 1, srv_depth.put());
+      if (!srv_depth)
+         return false;
+
+      // The game constants the XeGTAO shaders read. dgVoodoo keeps SEPARATE per-stage cb4 buffers: PS cb4
+      // ([16].zw texel size, [17].z depth scale) goes to CS b0, VS cb4 ([29].x/[30].y projection m00/m11,
+      // the source of the o7 ScreenPosScaleBias the game's own AO pixel shader consumes) to CS b1.
+      ComPtr<ID3D11Buffer> cb_game_ps, cb_game_vs;
+      native_device_context->PSGetConstantBuffers(4, 1, cb_game_ps.put());
+      native_device_context->VSGetConstantBuffers(4, 1, cb_game_vs.put());
+      if (!cb_game_ps || !cb_game_vs)
+         return false;
+
+      // (Re)create the working textures on resolution change.
+      const uint32_t w = rt_desc.Width, h = rt_desc.Height;
+      if (gd.xegtao_w != w || gd.xegtao_h != h)
+      {
+         gd.tex_xegtao_depths.reset();
+         for (auto& uav : gd.uav_xegtao_depths)
+            uav.reset();
+         gd.srv_xegtao_depths.reset();
+         for (int i = 0; i < 2; i++)
+         {
+            gd.tex_xegtao_ao[i].reset();
+            gd.uav_xegtao_ao[i].reset();
+            gd.srv_xegtao_ao[i].reset();
+         }
+         gd.tex_xegtao_final.reset();
+         gd.uav_xegtao_final.reset();
+         gd.xegtao_w = 0;
+         gd.xegtao_h = 0;
+
+         D3D11_TEXTURE2D_DESC td = {};
+         td.Width = w;
+         td.Height = h;
+         td.MipLevels = kXeGTAODepthMipLevels;
+         td.ArraySize = 1;
+         td.Format = DXGI_FORMAT_R32_FLOAT;
+         td.SampleDesc.Count = 1;
+         td.Usage = D3D11_USAGE_DEFAULT;
+         td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         if (FAILED(native_device->CreateTexture2D(&td, nullptr, gd.tex_xegtao_depths.put())))
+            return false;
+         D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+         uav_desc.Format = td.Format;
+         uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+         for (UINT i = 0; i < kXeGTAODepthMipLevels; i++)
+         {
+            uav_desc.Texture2D.MipSlice = i;
+            if (FAILED(native_device->CreateUnorderedAccessView(gd.tex_xegtao_depths.get(), &uav_desc, gd.uav_xegtao_depths[i].put())))
+               return false;
+         }
+         if (FAILED(native_device->CreateShaderResourceView(gd.tex_xegtao_depths.get(), nullptr, gd.srv_xegtao_depths.put())))
+            return false;
+
+         td.MipLevels = 1;
+         td.Format = DXGI_FORMAT_R8G8_UNORM;
+         for (int i = 0; i < 2; i++)
+         {
+            if (FAILED(native_device->CreateTexture2D(&td, nullptr, gd.tex_xegtao_ao[i].put())))
+               return false;
+            if (FAILED(native_device->CreateUnorderedAccessView(gd.tex_xegtao_ao[i].get(), nullptr, gd.uav_xegtao_ao[i].put())))
+               return false;
+            if (FAILED(native_device->CreateShaderResourceView(gd.tex_xegtao_ao[i].get(), nullptr, gd.srv_xegtao_ao[i].put())))
+               return false;
+         }
+
+         td.Format = rt_desc.Format; // must match the game's AO buffer exactly (CopyResource)
+         if (FAILED(native_device->CreateTexture2D(&td, nullptr, gd.tex_xegtao_final.put())))
+            return false;
+         if (FAILED(native_device->CreateUnorderedAccessView(gd.tex_xegtao_final.get(), nullptr, gd.uav_xegtao_final.put())))
+            return false;
+
+         gd.xegtao_w = w;
+         gd.xegtao_h = h;
+      }
+
+      const float p[8] = {g_xegtao_intensity, kXeGTAORadiusFraction, kXeGTAORadiusFixed, kXeGTAOFalloffRange, kXeGTAODistributionPower, kXeGTAOThinOccluder, kXeGTAOFinalPower, 0.f};
+      if (!gd.cb_xegtao || memcmp(gd.xegtao_params, p, sizeof(p)) != 0)
+      {
+         if (CreateImmutableCB(native_device, p, sizeof(p), gd.cb_xegtao))
+            memcpy(gd.xegtao_params, p, sizeof(p));
+      }
+      if (!gd.cb_xegtao)
+         return false;
+
+      DrawStateStack<DrawStateStackType::Compute> cs_state;
+      cs_state.Cache(native_device_context, device_data.uav_max_count);
+
+      ID3D11Buffer* cbs[3] = {cb_game_ps.get(), cb_game_vs.get(), gd.cb_xegtao.get()};
+      native_device_context->CSSetConstantBuffers(0, 3, cbs);
+      ID3D11SamplerState* smp_point = device_data.sampler_state_point.get();
+      native_device_context->CSSetSamplers(0, 1, &smp_point);
+
+      ID3D11ShaderResourceView* srv_nulls[2] = {};
+      ID3D11UnorderedAccessView* uav_nulls[kXeGTAODepthMipLevels] = {};
+
+      // 1. Prefilter: buffer A -> viewspace-depth MIP pyramid (each 8x8 group covers a 16x16 block).
+      ID3D11ShaderResourceView* srvs[2] = {srv_depth.get(), nullptr};
+      ID3D11UnorderedAccessView* uavs_depths[kXeGTAODepthMipLevels];
+      for (UINT i = 0; i < kXeGTAODepthMipLevels; i++)
+         uavs_depths[i] = gd.uav_xegtao_depths[i].get();
+      native_device_context->CSSetShaderResources(0, 1, srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, kXeGTAODepthMipLevels, uavs_depths, nullptr);
+      native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
+      native_device_context->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+      native_device_context->CSSetUnorderedAccessViews(0, kXeGTAODepthMipLevels, uav_nulls, nullptr);
+
+      // 2. Main pass: depth pyramid -> (AO, packed edges), normals derived from depth in-shader.
+      srvs[0] = gd.srv_xegtao_depths.get();
+      ID3D11UnorderedAccessView* uav = gd.uav_xegtao_ao[0].get();
+      native_device_context->CSSetShaderResources(0, 1, srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+      native_device_context->CSSetShader(cs_main, nullptr, 0);
+      native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls, nullptr);
+
+      // 3. Denoise 1 (each thread covers 2 horizontal pixels).
+      srvs[0] = gd.srv_xegtao_ao[0].get();
+      uav = gd.uav_xegtao_ao[1].get();
+      native_device_context->CSSetShaderResources(0, 1, srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+      native_device_context->CSSetShader(cs_denoise1, nullptr, 0);
+      native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls, nullptr);
+
+      // 4. Denoise 2 (final): also reads buffer A at t1 for the depth passthrough + sky test, and writes the
+      // game's (AO, depth) buffer-B convention into our R32G32F copy source.
+      srvs[0] = gd.srv_xegtao_ao[1].get();
+      srvs[1] = srv_depth.get();
+      uav = gd.uav_xegtao_final.get();
+      native_device_context->CSSetShaderResources(0, 2, srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+      native_device_context->CSSetShader(cs_denoise2, nullptr, 0);
+      native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls, nullptr);
+      native_device_context->CSSetShaderResources(0, 2, srv_nulls);
+
+      cs_state.Restore(native_device_context);
+
+      // Publish into the game's AO buffer; the (skipped) blurs and the vanilla apply pass read from it.
+      native_device_context->CopyResource(rt_res.get(), gd.tex_xegtao_final.get());
+      return true;
    }
 
    // Re-applies the stencil test dgVoodoo drops on the item card's rolling price digits. Returns true iff it ran
@@ -870,6 +1122,29 @@ public:
       if (RepairScaleformStencilMask(native_device, native_device_context, gd, original_shader_hashes, is_custom_pass, is_immediate, original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
+      // XeGTAO (see kAOOcclusionHash2813): replace the game's SSAO occlusion pass with the XeGTAO compute
+      // chain. The game's own depth-setup and apply passes stay vanilla; its bilateral blurs are redundant
+      // (XeGTAO denoises itself) and get skipped while the hijack is live this frame.
+      if (is_immediate && !is_custom_pass)
+      {
+         if (g_xegtao_enable && original_shader_hashes.Contains(kAOOcclusionHash2813, reshade::api::shader_stage::pixel))
+         {
+            if (RunXeGTAO(native_device, native_device_context, device_data, gd))
+            {
+               gd.xegtao_fired_this_frame = true;
+               return DrawOrDispatchOverrideType::Replaced; // the CS chain + CopyResource produced this draw's output
+            }
+         }
+         else if (gd.xegtao_fired_this_frame && original_shader_hashes.Contains(kAOBlurHash2813, reshade::api::shader_stage::pixel))
+         {
+            return DrawOrDispatchOverrideType::Skip;
+         }
+         else if (gd.xegtao_fired_this_frame && original_shader_hashes.Contains(kAOApplyHash2813, reshade::api::shader_stage::pixel))
+         {
+            gd.xegtao_fired_this_frame = false; // end of the game's AO chain; the vanilla apply composites our AO
+         }
+      }
+
       // Track the LDR buffer (the tonemap's render target). The HUD draws onto it afterwards; the Hide UI
       // toggle uses this to recognize (and drop) those HUD draws.
       if (is_immediate && IsAnyTonemap(original_shader_hashes))
@@ -1009,6 +1284,8 @@ public:
       // Never carry a Scaleform mask span across frames.
       gd.scaleform_mask_armed = false;
       gd.dsv_scaleform_mask_active.reset();
+      // Same for the XeGTAO blur-skip span, in case the apply draw never came (e.g. a loading screen cut the frame short)
+      gd.xegtao_fired_this_frame = false;
    }
 
    void LoadConfigs() override
@@ -1035,6 +1312,10 @@ public:
 
       reshade::get_config_value(nullptr, PROJECT_NAME, "LumaBloomEnable", g_luma_bloom_enable);
       gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f; // mirror to the shader composite switch
+
+      reshade::get_config_value(nullptr, PROJECT_NAME, "XeGTAOEnable", g_xegtao_enable);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "XeGTAOIntensity", g_xegtao_intensity);
+      g_xegtao_intensity = std::clamp(g_xegtao_intensity, 0.f, 2.f);
 
       reshade::get_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
 
@@ -1208,6 +1489,21 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       }
+      ImGui::EndDisabled();
+
+      ImGui::SeparatorText("Ambient Occlusion");
+      if (ImGui::Checkbox("XeGTAO Ambient Occlusion", &g_xegtao_enable))
+         reshade::set_config_value(nullptr, PROJECT_NAME, "XeGTAOEnable", g_xegtao_enable);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Replaces the game's SSAO with Intel XeGTAO (higher quality ambient occlusion).\nRequires Ambient Occlusion enabled in the game's video settings. Off = vanilla game SSAO.");
+      ImGui::BeginDisabled(!g_xegtao_enable);
+      ImGui::SliderFloat("AO Intensity", &g_xegtao_intensity, 0.f, 2.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "XeGTAOIntensity", g_xegtao_intensity);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Ambient occlusion strength (1 = XeGTAO default; above 1 darkens further).");
+      if (DrawResetButton(g_xegtao_intensity, 1.f, "XeGTAOIntensity"))
+         reshade::set_config_value(nullptr, PROJECT_NAME, "XeGTAOIntensity", g_xegtao_intensity);
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("UI");
