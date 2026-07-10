@@ -1,0 +1,97 @@
+name: Build Borderlands Luma Artifacts
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PROJECT_NAME: Borderlands 2 and The Pre-Sequel
+  PACKAGE_NAME: Luma-Borderlands_2_and_The_Pre-Sequel
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: Publishing-Release
+            platform: Win32
+            suffix: Release
+          - config: Development-Release
+            platform: Win32
+            suffix: Dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Build ReShade 32-bit Release
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="32-bit"
+
+      - name: Build ${{ env.PROJECT_NAME }} ${{ matrix.config }}
+        run: >
+          msbuild "Source\Games\${{ env.PROJECT_NAME }}\${{ env.PROJECT_NAME }}.vcxproj"
+          /p:Configuration=${{ matrix.config }}
+          /p:Platform=${{ matrix.platform }}
+          /p:SolutionName=Luma
+          /p:SolutionDir="${{ github.workspace }}\"
+          /p:DefineConstants="REMOTE_BUILD=1"
+
+      - name: Stage mod files
+        shell: pwsh
+        run: |
+          $projectName = "${{ env.PROJECT_NAME }}"
+          $packageName = "${{ env.PACKAGE_NAME }}-${{ matrix.suffix }}"
+          $packageRoot = Join-Path "artifact" $packageName
+          $lumaRoot = Join-Path $packageRoot "Luma"
+          $addonPath = Join-Path "Binaries\${{ matrix.platform }}-${{ matrix.config }}" "Luma-$projectName.addon"
+          $reshadePath = "Source\External\reshade\bin\Win32\Release\ReShade32.dll"
+          $compilerPath = "Shaders\Decompiler\d3dcompiler_47_x32.dll"
+
+          if (-not (Test-Path $addonPath)) {
+            throw "Expected addon was not built: $addonPath"
+          }
+          if (-not (Test-Path $reshadePath)) {
+            throw "Expected ReShade DLL was not built: $reshadePath"
+          }
+          if (-not (Test-Path $compilerPath)) {
+            throw "Expected D3D compiler DLL is missing: $compilerPath"
+          }
+
+          Remove-Item -Recurse -Force "artifact" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $lumaRoot -Force | Out-Null
+
+          Copy-Item -Path $addonPath -Destination (Join-Path $packageRoot "Luma-$projectName.addon") -Force
+          Copy-Item -Path $reshadePath -Destination (Join-Path $packageRoot "dxgi.dll") -Force
+          Copy-Item -Path $compilerPath -Destination $lumaRoot -Force
+
+          Copy-Item -Path "Shaders\Global" -Destination $lumaRoot -Recurse -Force
+          Copy-Item -Path "Shaders\Includes" -Destination $lumaRoot -Recurse -Force
+          Copy-Item -Path "Shaders\$projectName" -Destination $lumaRoot -Recurse -Force
+
+          if ("${{ matrix.config }}" -notlike "Development*") {
+            Get-ChildItem -Path $lumaRoot -Directory -Recurse |
+              Where-Object { $_.Name -in @("Unused", "Dev", "Sample") } |
+              Remove-Item -Recurse -Force
+          }
+
+          Get-ChildItem -Path $lumaRoot -Recurse -File |
+            Where-Object { $_.Extension.ToLowerInvariant() -notin @(".hlsl", ".hlsli", ".dll") } |
+            Remove-Item -Force
+
+      - name: Upload mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}-${{ matrix.suffix }}
+          path: artifact/${{ env.PACKAGE_NAME }}-${{ matrix.suffix }}/
+          if-no-files-found: error
