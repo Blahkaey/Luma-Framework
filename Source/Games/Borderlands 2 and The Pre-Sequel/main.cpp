@@ -30,7 +30,9 @@
 
 // FXAA resolve PS (only present when AA is enabled in the game's video settings) — replaced with SMAA. RE in NOTES.
 static constexpr uint32_t kFXAAResolveHash = 0x0D3001F6;
+static constexpr uint32_t kFXAAResolveHash2813 = 0xDF7DB98D;
 static constexpr uint32_t kTonemapHash = 0xD00AA2A7;    // BL2: writes the LDR buffer the HUD then draws onto
+static constexpr uint32_t kTonemapHash2813 = 0xF14F8664;
 static constexpr uint32_t kTonemapHashTPS = 0xFCFE623E; // The Pre-Sequel: same engine, different tonemap CSO (one addon serves both)
 
 // Luma-injected SRV slots on the tonemap. These MUST match the shader register macros in
@@ -399,7 +401,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
-      // User HDR grade controls (read in Tonemap_0xD00AA2A7.ps_5_0.hlsl via LumaSettings.GameSettings). All
+      // User HDR grade controls (read in the tonemap replacement via LumaSettings.GameSettings). All
       // default to a vanilla no-op. Exposure/Bloom/Vignette act on both SDR+HDR; Saturation/Dechroma/Contrast HDR-only.
       default_luma_global_game_settings.Exposure = 1.f;          // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;        // Oklab saturation
@@ -412,6 +414,13 @@ public:
       default_luma_global_game_settings.DOFType = 2.f;           // 0 = vanilla game DoF, 2 = Luma separable Gaussian (default)
       default_luma_global_game_settings.Dithering = 1.f;         // animated triangular dither at output (HDR), anti-banding on
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
+
+      // Retire shader names shipped by an earlier version so updated installs do not load duplicate hash matches.
+#if !DEVELOPMENT
+      old_shader_file_names.emplace("Tonemap_0xD00AA2A7.ps_5_0.hlsl");
+      old_shader_file_names.emplace("UIEmissive_0xC84956AA.ps_5_0.hlsl");
+      old_shader_file_names.emplace("Video_0xE41621CF.ps_5_0.hlsl");
+#endif
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -619,10 +628,11 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+      const bool is_tonemap = is_immediate && (original_shader_hashes.Contains(kTonemapHash, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kTonemapHash2813, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kTonemapHashTPS, reshade::api::shader_stage::pixel));
 
       // Track the LDR buffer (the tonemap's render target). The HUD draws onto it afterwards; the Hide UI
       // toggle uses this to recognize (and drop) those HUD draws.
-      if (is_immediate && (original_shader_hashes.Contains(kTonemapHash, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kTonemapHashTPS, reshade::api::shader_stage::pixel)))
+      if (is_tonemap)
       {
          // The Pre-Sequel's tonemap inserts a LightShaftTexture at slot 1, shifting its native textures down one
          // (LUT@t4, DOF@t5) vs BL2. The replaced tonemap shader (Tonemap_0xFCFE623E) compensates in its register
@@ -718,7 +728,9 @@ public:
       // buffer-independent: BL2 draws the HUD on the tonemap's LDR, but TPS routes it to a separate post-FXAA buffer.
       // `tonemap_fired_this_frame` scopes this to the current frame's post-tonemap span (so next frame's pre-tonemap
       // transparents survive). RT==LDR kept as a BL2 superset; the mod menu draws post-composition, stays visible.
-      if (g_hide_ui && is_immediate && !is_custom_pass && gd.tonemap_fired_this_frame && !original_shader_hashes.Contains(kTonemapHash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(kTonemapHashTPS, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(kFXAAResolveHash, reshade::api::shader_stage::pixel))
+      const bool hide_ui_candidate = g_hide_ui && is_immediate && !is_custom_pass && gd.tonemap_fired_this_frame && !is_tonemap;
+      const bool is_fxaa = hide_ui_candidate && (original_shader_hashes.Contains(kFXAAResolveHash, reshade::api::shader_stage::pixel) || original_shader_hashes.Contains(kFXAAResolveHash2813, reshade::api::shader_stage::pixel));
+      if (hide_ui_candidate && !is_fxaa)
       {
          ComPtr<ID3D11BlendState> blend_state;
          FLOAT blend_factor[4];

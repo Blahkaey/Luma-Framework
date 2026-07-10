@@ -15,6 +15,13 @@
 // VERBATIM (register-level) from the readable DX9 BL2 tonemap (tonemap_0x54ED86A0.ps_3_0),
 // constants remapped DX9 cN -> cb4[N+8] (verified vs the live 0xD00AA2A7 disasm).
 //
+// 0xF14F8664 is the same shader under dgVoodoo 2.81.3 (last version that works under Wine/Linux; older
+// translators target ps_4_0, so the CSO hash differs): verified from a 2.81.3 dump to keep the same
+// cb3[77]/cb4[236] layout, the same cb4[16..22] constants (reads exactly those and nothing else), the same
+// t0-t4/s0-s4 slots and 6-sample order. Its only body delta is dgVoodoo texture-format mask/set pairs
+// (cb3[44..53]) applied after each sample; those are identity for these textures (the 2.84 translator proved
+// it by omitting them entirely), so both hashes share this maskless file.
+//
 // HDR output uses the "apply SDR LUT in HDR" method: max-channel-compress the raw scene into [0,1] BEFORE the
 // grade+LUT (so neither the per-channel saturate nor the LUT clip -> highlight hue/chroma preserved), then expand
 // back with the exact inverse (sdr / tm) and DICE-map to the display peak. SDR mode keeps tm=1 -> the grade runs on

@@ -9,6 +9,9 @@
 // Fix: re-add the vanilla 8-bit clamp dgVoodoo dropped (saturate the output) so the icon lands at UI paper white
 // like the rest of the HUD. Body transcribed VERBATIM from the live dgVoodoo->ps_5_0 disasm of 0xC84956AA; the
 // cb3 and/or pairs are dgVoodoo's texture-format bit emulation (mask+set), kept exactly via asint.
+// 0xAE61FB46 is the same shader under dgVoodoo 2.81.3 (last version that works under Wine/Linux): identical
+// body register-for-register (same cb3[44..51] mask pairs, same cb4[16..19] constants, same sample order),
+// only the ps_4_0 target changes the CSO hash, so both hashes share this file.
 
 Texture2D<float4> t0 : register(t0);
 Texture2D<float4> t1 : register(t1);

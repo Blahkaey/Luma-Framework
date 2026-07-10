@@ -8,6 +8,9 @@
 // Body transcribed VERBATIM from the live dgVoodoo->ps_5_0 disasm of 0xE41621CF (maps the DX9 video shader
 // 0x33244F80: tor/tog/tob/consts c0..c3 -> cb4[8..11], same cb4[N+8] mapping as the tonemap). The cb3 and/or
 // pairs are dgVoodoo's texture-format bit emulation (mask+set), kept exactly via asuint/asfloat.
+// 0x7EBF990A is the same shader under dgVoodoo 2.81.3 (last version that works under Wine/Linux): its older
+// translators target ps_4_0 instead of ps_5_0 but emit an identical body (same cb3[44..49] mask pairs,
+// same cb4[8..11] matrix), so only the CSO hash differs and both hashes share this file.
 // NOTE: dgVoodoo dropped the SM3 `saturate(o)` (the vanilla 8-bit UNORM backbuffer clamped for free); the fp16
 // swapchain does not, so we re-add it before the AutoHDR (kills YUV overshoot + negatives).
 

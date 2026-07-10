@@ -21,4 +21,4 @@
 #define TM_S_VIGNETTE     s3
 #define TM_S_LUT          s4
 #define TM_S_DOF          s5
-#include "Tonemap_0xD00AA2A7.ps_5_0.hlsl"
+#include "Tonemap_0xD00AA2A7_0xF14F8664.ps_5_0.hlsl"
