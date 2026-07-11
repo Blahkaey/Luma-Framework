@@ -26,6 +26,12 @@ __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintpt
    {
       CDeferredFxAntialiasRenderer = a1;
       m_deferredFxAntialiasRenderer = reinterpret_cast<CDeferredFxAntialiasRendererS*>(a1);
+      m_deferredFXRendererContextTextures.m_currFrameTexture = m_deferredFxAntialiasRenderer->m_currDeferredFXAntialiasFrameTexture;
+      
+      uintptr_t m_rendererHelpers = *reinterpret_cast<uintptr_t*>(a1 + 40);
+
+      float game_time_delta = *reinterpret_cast<float*>(m_rendererHelpers + 1912) - *reinterpret_cast<float*>(m_rendererHelpers + 1916);
+      ZeroTimeDelta = game_time_delta == 0.0f;
    }
    
    if (a2 && a2[13])
@@ -37,7 +43,7 @@ __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintpt
       m_viewportParamProvider = reinterpret_cast<CViewportShaderParameterProvider*>(base);
       
       {
-         m_deferredFXRendererContextTextures.m_accumBuffer = reinterpret_cast<CIndirectTexture*>(a2[0]);
+         //m_deferredFXRendererContextTextures.m_accumBuffer = reinterpret_cast<CIndirectTexture*>(a2[0]);
          m_deferredFXRendererContextTextures.m_linearDepthTexture = reinterpret_cast<CIndirectTexture*>(a2[1]);
          m_deferredFXRendererContextTextures.m_smallDepthColorTexture = reinterpret_cast<CIndirectTexture*>(a2[2]);
          m_deferredFXRendererContextTextures.m_depthStencilSurface = reinterpret_cast<CIndirectTexture*>(a2[3]);
@@ -53,11 +59,6 @@ __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintpt
 
    auto original_result = g_deferred_fx_antialias_renderer_hook
        .unsafe_call<__int64>(a1, a2);
-   
-   if (a1)
-   {
-      m_currDeferredFXAntialiasFrameTexture = m_deferredFxAntialiasRenderer->m_currDeferredFXAntialiasFrameTexture;
-   }
    
    return original_result;
 }

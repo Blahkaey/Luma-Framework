@@ -36,7 +36,7 @@ void main(
   o0.rgb = o0.rgb * GammaBrightnessContrastParams.y + GammaBrightnessContrastParams.z; // These are best left at neutral default (1 and 0)
   
 #if POST_PROCESS_SPACE_TYPE == 0
-  o0.rgb = LinearToSRGB(o0.rgb);
+  //o0.rgb = LinearToSRGB(o0.rgb);
 #endif
 
   // Luma: display mapping. Do it here because it's the "final" shader before UI, afte AA etc

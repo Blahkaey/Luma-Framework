@@ -46,14 +46,14 @@ struct CIndirectTexture {
 };
 
 struct CCameraMatrices {
-   Math::Matrix44F m_viewMatrix; // 0x0  (size 0x40)
-   Math::Matrix44F m_viewMatrixInverse; // 0x40  (size 0x40)
-   Math::Matrix44F m_viewMatrixPure; // 0x80  (size 0x40)
-   Math::Matrix44F m_projectionMatrix; // 0xC0  (size 0x40)
-   Math::Matrix44F m_projectionMatrixPure; // 0x100  (size 0x40)
-   Math::Matrix44F m_projectionMatrixInverse; // 0x140  (size 0x40)
-   Math::Matrix44F m_viewProjectionMatrix; // 0x180  (size 0x40)
-   Math::Matrix44F m_viewProjectionMatrixInverse; // 0x1C0  (size 0x40)
+   DirectX::XMMATRIX m_viewMatrix; // 0x0  (size 0x40)
+   DirectX::XMMATRIX m_viewMatrixInverse; // 0x40  (size 0x40)
+   DirectX::XMMATRIX m_viewMatrixPure; // 0x80  (size 0x40)
+   DirectX::XMMATRIX m_projectionMatrix; // 0xC0  (size 0x40)
+   DirectX::XMMATRIX m_projectionMatrixPure; // 0x100  (size 0x40)
+   DirectX::XMMATRIX m_projectionMatrixInverse; // 0x140  (size 0x40)
+   DirectX::XMMATRIX m_viewProjectionMatrix; // 0x180  (size 0x40)
+   DirectX::XMMATRIX m_viewProjectionMatrixInverse; // 0x1C0  (size 0x40)
 };
 
 struct CCamera
@@ -142,7 +142,7 @@ struct CViewportShaderParameterProvider
 
 struct CDeferredFxRendererContextTextures
 {
-   CIndirectTexture* m_accumBuffer; // 0x0  (size 0x8)
+   CIndirectTexture* m_currFrameTexture; // 0x0  (size 0x8)
    CIndirectTexture* m_linearDepthTexture; // 0x8  (size 0x8)
    CIndirectTexture* m_smallDepthColorTexture; // 0x10  (size 0x8)
    CIndirectTexture* m_depthStencilSurface; // 0x18  (size 0x8)
@@ -155,9 +155,9 @@ struct CDeferredFxRendererContextTextures
 struct CDeferredFxAntialiasRendererS
 {
    uint8_t field_0[0x18]; // 0x0  (size 0x18)
-   CTexture* m_currDeferredFXAntialiasFrameTexture; // 0x18  (size 0x8)
-   bool m_useAsyncCopy; // 0x20  (size 0x1)
+   bool m_useAsyncCopy; // 0x18  (size 0x1)
    uint8_t _pad_21[0x7]; // padding
+   CIndirectTexture* m_currDeferredFXAntialiasFrameTexture; // 0x20  (size 0x8)
    uintptr_t* m_rendererHelpers; // 0x28  (size 0x8)
    uintptr_t* m_volatileTextureManager; // 0x30  (size 0x8)
    uintptr_t* m_clearTextureFrameJob; // 0x38  (size 0x8)
@@ -199,6 +199,7 @@ extern CDeferredFxAntialiasRendererS* m_deferredFxAntialiasRenderer;
 extern CDeferredFxRendererContextTextures m_deferredFXRendererContextTextures;
 extern CTexture* m_currDeferredFXAntialiasFrameTexture;
 extern uintptr_t JitterTableOffset;
+bool ZeroTimeDelta;
 
 extern std::atomic<bool> bIsNetHackingRendering;
 
