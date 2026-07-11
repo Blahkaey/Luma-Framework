@@ -115,87 +115,6 @@ namespace
       std::memcpy((void*)JitterTableOffset, &jit, sizeof(jit));
    }
    
-   DirectX::XMMATRIX ComputeCameraSpaceToPreviousProjectedSpaceMatrix()
-   {
-      using namespace DirectX;
-	   
-      XMMATRIX inv_view_matrix_current = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_cameraMatrix.m_viewMatrixInverse));
-      XMMATRIX inv_view_matrix_prev = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_cameraMatrix.m_viewMatrixInverse));
-      XMMATRIX proj_prev = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_cameraMatrix.m_projectionMatrix));
-		   
-      proj_prev = XMMatrixTranspose(proj_prev);
-      
-      float4 position_delta = {0.0,0.0,0.0,1.0};
-      position_delta.x = inv_view_matrix_current.r[3].m128_f32[0] - inv_view_matrix_prev.r[3].m128_f32[0];
-      position_delta.y = inv_view_matrix_current.r[3].m128_f32[1] - inv_view_matrix_prev.r[3].m128_f32[1];
-      position_delta.z = inv_view_matrix_current.r[3].m128_f32[2] - inv_view_matrix_prev.r[3].m128_f32[2];
-      
-      inv_view_matrix_current = XMMatrixTranspose(inv_view_matrix_current);
-      inv_view_matrix_prev = XMMatrixTranspose(inv_view_matrix_prev);
-      
-      XMMATRIX view_rotation_prev = inv_view_matrix_prev;
-      view_rotation_prev.r[0].m128_f32[3] = 0.0;
-      view_rotation_prev.r[1].m128_f32[3] = 0.0;
-      view_rotation_prev.r[2].m128_f32[3] = 0.0;
-      view_rotation_prev.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-      
-      {
-         XMVECTOR c0 = view_rotation_prev.r[0];
-         XMVECTOR c1 = view_rotation_prev.r[1];
-         XMVECTOR c2 = view_rotation_prev.r[2];
-
-         view_rotation_prev.r[0] = XMVectorSet(XMVectorGetX(c0), XMVectorGetX(c1), XMVectorGetX(c2), 0.0f);
-         view_rotation_prev.r[1] = XMVectorSet(XMVectorGetY(c0), XMVectorGetY(c1), XMVectorGetY(c2), 0.0f);
-         view_rotation_prev.r[2] = XMVectorSet(XMVectorGetZ(c0), XMVectorGetZ(c1), XMVectorGetZ(c2), 0.0f);
-         view_rotation_prev.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-      }
-      
-      XMMATRIX inv_view_delta_matrix_current = inv_view_matrix_current;
-      inv_view_delta_matrix_current.r[0].m128_f32[3] = position_delta.x;
-      inv_view_delta_matrix_current.r[1].m128_f32[3] = position_delta.y;
-      inv_view_delta_matrix_current.r[2].m128_f32[3] = position_delta.z;
-      
-      XMMATRIX temp = XMMatrixMultiply(proj_prev, view_rotation_prev);
-      return XMMatrixMultiply(temp, inv_view_delta_matrix_current);
-   }
-   
-   DirectX::XMMATRIX ComputePreviousViewRotProjectionMatrix()
-   {
-      using namespace DirectX;
-      
-      XMMATRIX view_matrix_prev = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_cameraMatrix.m_viewMatrix));
-      XMMATRIX proj_prev = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_cameraMatrix.m_projectionMatrix));
-
-      proj_prev = XMMatrixTranspose(proj_prev);
-      view_matrix_prev.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-      view_matrix_prev = XMMatrixTranspose(view_matrix_prev);
-
-      return XMMatrixMultiply(proj_prev, view_matrix_prev);
-   }
-   
-   DirectX::XMMATRIX ComputeViewRotProjectionPureMatrix()
-   {
-      using namespace DirectX;
-      
-      XMMATRIX view_matrix = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_cameraMatrix.m_viewMatrix));
-      XMMATRIX proj = XMLoadFloat4x4(
-         reinterpret_cast<const XMFLOAT4X4*>(&m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_cameraMatrix.m_projectionMatrix));
-
-      proj = XMMatrixTranspose(proj);
-      proj.r[0].m128_f32[2] = 0.0f;
-      proj.r[1].m128_f32[2] = 0.0f;
-      view_matrix.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-      view_matrix = XMMatrixTranspose(view_matrix);
-
-      return XMMatrixMultiply(proj, view_matrix);
-   }
-   
    ShaderHashesList shader_hashes_SMAA_Reprojection;
    ShaderHashesList shader_hashes_SMAA_EdgeDectction;
    ShaderHashesList shader_hashes_TemporalResolve;
@@ -211,8 +130,6 @@ namespace
 #endif
    
    std::shared_mutex materials_mutex;
-   
-   std::unordered_set<ID3D11DeviceContext*> motion_vector_contexts;
 }
 
 struct GameDeviceDataWatchDogs2 final : public GameDeviceData
@@ -225,6 +142,11 @@ struct GameDeviceDataWatchDogs2 final : public GameDeviceData
    ComPtr<ID3D11Texture2D> source_color;
    ComPtr<ID3D11ShaderResourceView> source_color_srv;
    ComPtr<ID3D11RenderTargetView> source_color_rtv;
+   
+   ComPtr<ID3D11Texture2D> motion_vectors;
+   ComPtr<ID3D11ShaderResourceView> motion_vectors_srv;
+   ComPtr<ID3D11RenderTargetView> motion_vectors_rtv;
+   
    ComPtr<ID3D11Buffer> viewport_cbv;
    ComPtr<ID3D11ShaderResourceView> sr_output_color_srv;
    
@@ -248,7 +170,8 @@ struct GameDeviceDataWatchDogs2 final : public GameDeviceData
    // the command list we split to interject dlss
    ComPtr<ID3D11CommandList> partial_command_list;
 
-   ComPtr<ID3D11Buffer> modifiable_index_vertex_buffer;
+   bool has_previous_frame_history = false;
+   bool has_drawn_upscaling = false;
    
    ComPtr<ID3D11Buffer> cbuffer_skin_cache;
    std::unique_ptr<StretchyBuffer> prev_skin_buffer;
@@ -257,11 +180,6 @@ struct GameDeviceDataWatchDogs2 final : public GameDeviceData
    std::unordered_map<ID3D11Buffer*, SkinCacheEntry> skin_lookup;
    
    std::mutex game_device_data_mutex;
-
-   DirectX::XMMATRIX CameraSpaceToPreviousProjectedSpace;
-   DirectX::XMMATRIX PreviousViewRotProjectionMatrix;
-   
-   float2 render_resolution;
    
    void CleanMVResources()
    {
@@ -426,7 +344,7 @@ public:
             reshade::log::message(reshade::log::level::error, "Failed to create inline hook");
          }
       }
-      
+
       native_shaders_definitions.emplace(CompileTimeStringHash("Unjitter Depth"), ShaderDefinition{"Luma_CopyDepth", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("Copy Luminance"), ShaderDefinition{"Luma_CopyLuminance", reshade::api::pipeline_subobject_type::compute_shader});
       
@@ -451,6 +369,7 @@ public:
       if (!failed)
       {
          reshade::register_event<reshade::addon_event::execute_secondary_command_list>(WatchDogs2::OnExecuteSecondaryCommandList);
+         reshade::register_event<reshade::addon_event::clear_render_target_view>(WatchDogs2::OnClearRenderTargetView);
          //reshade::register_event<reshade::addon_event::create_pipeline>(WatchDogs2::OnCreatePipeline);
 #if DEVELOPMENT
          reshade::log::message(reshade::log::level::info, "OnLoad: OnExecuteSecondaryCommandList()");
@@ -736,8 +655,8 @@ public:
          D3D11_TEXTURE2D_DESC desc;
          game_device_data.decoded_motion_vectors.get()->GetDesc(&desc);
          // Return early if resources already exist with correct dimensions
-         bool output_changed = desc.Width != m_viewportPrivateData->m_viewportSize[0]
-         || desc.Height != m_viewportPrivateData->m_viewportSize[1];
+         bool output_changed = desc.Width != g_perFrame.RenderResolutionInt.x
+         || desc.Height != g_perFrame.RenderResolutionInt.y;
          if (!output_changed)
          {
             return true;
@@ -748,8 +667,8 @@ public:
       HRESULT hr;
       
       D3D11_TEXTURE2D_DESC tex_desc;
-      tex_desc.Width = m_viewportPrivateData->m_viewportSize[0];
-      tex_desc.Height = m_viewportPrivateData->m_viewportSize[1];
+      tex_desc.Width = g_perFrame.RenderResolutionInt.x;
+      tex_desc.Height = g_perFrame.RenderResolutionInt.y;
       tex_desc.Usage = D3D11_USAGE_DEFAULT;
       tex_desc.ArraySize = 1;
       tex_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -859,6 +778,42 @@ public:
       return true;
    }
    
+   static bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float color[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      if (rtv.handle == 0)
+         return false;
+      
+      auto& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      auto& game_device_data = GetGameDeviceData(device_data);
+      
+      if (device_data.sr_type == SR::Type::None)
+         return false;  
+      
+      if (game_device_data.motion_vectors_rtv)
+         return false;
+      
+      if (color[0] != 0.0f || color[1] != 0.0f || color[2] != 0.0f || color[3] != 0.0f)
+         return false;
+      
+      {
+         auto* device = cmd_list->get_device();
+         auto current_rtv_resource = device->get_resource_from_view(rtv);
+         auto current_rtv = device->get_resource_desc(current_rtv_resource);
+
+         // specifically float, not typeless
+         if (current_rtv.texture.format == reshade::api::format::r16g16_float)
+         {
+            if (current_rtv.texture.width != g_perFrame.RenderResolutionInt.x || current_rtv.texture.height != g_perFrame.RenderResolutionInt.y)
+               return false;
+            
+            ID3D11RenderTargetView* native_rtv = reinterpret_cast<ID3D11RenderTargetView*>(rtv.handle);
+            game_device_data.motion_vectors_rtv = native_rtv;
+         }
+      }
+      
+      return false;
+   }
+   
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
 #if HDR_ENABLED
@@ -891,7 +846,6 @@ public:
       }
       
       auto& game_device_data = GetGameDeviceData(device_data);
-
       {
          //const std::shared_lock lock(materials_mutex);
          if (original_shader_hashes.Contains(shader_hashes_Materials))
@@ -906,7 +860,7 @@ public:
             return DrawOrDispatchOverrideType::None;
          }
       }
-      
+
       if (original_shader_hashes.Contains(shader_hashes_ClothPreTransformed))
       {
          ID3D11Buffer* cbv;
@@ -959,7 +913,7 @@ public:
          //has_set_luma_cb_material = false;
          return DrawOrDispatchOverrideType::None;
       }
-      
+
       if (m_viewportPrivateData && CDeferredFxAntialiasRenderer && !bIsNetHackingRendering && GetAAOption() == OPTION_SMAA_T2X)
       {
          if (original_shader_hashes.Contains(shader_hashes_WaterGridVectorMap))
@@ -977,7 +931,6 @@ public:
                {
                   DrawSR(device_data, game_device_data, cmd_list_data, native_device, native_device_context);
                }
-               
 #if DEVELOPMENT
                wd2_debug_info.split_cmd_list = true;
                wd2_debug_info.deferred_context = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
@@ -1000,10 +953,14 @@ public:
          {
             if (device_data.sr_type != SR::Type::None)
             {
-               native_device_context->PSGetShaderResources(1, 1, game_device_data.source_color_srv.put());
+               ID3D11ShaderResourceView* srv[2];
+               native_device_context->PSGetShaderResources(1, 2, &srv[0]);
+               game_device_data.source_color_srv = srv[0];
+               game_device_data.motion_vectors_srv = srv[1];
                //native_device_context->PSGetConstantBuffers(0, 1, game_device_data.viewport_cbv.put());
                return DrawOrDispatchOverrideType::Skip;
             }
+            return DrawOrDispatchOverrideType::None;
          }
          
          if (original_shader_hashes.Contains(shader_hashes_SkyMoon))
@@ -1012,8 +969,8 @@ public:
             {
                native_device_context->OMGetRenderTargets(1, game_device_data.source_color_rtv.put(), nullptr);
                native_device_context->PSGetConstantBuffers(0, 1, game_device_data.viewport_cbv.put());
-               return DrawOrDispatchOverrideType::None;
             }
+            return DrawOrDispatchOverrideType::None;
          }
          
          if (original_shader_hashes.Contains(shader_hashes_TemporalResolve))
@@ -1022,9 +979,9 @@ public:
             {
                return DrawOrDispatchOverrideType::Skip;
             }
+            return DrawOrDispatchOverrideType::None;
          }
       }
-
       return DrawOrDispatchOverrideType::None;
    }
    
@@ -1035,27 +992,20 @@ public:
       ID3D11Device* native_device,
       ID3D11DeviceContext* native_device_context)
    {
-      const auto* motionVectors = m_deferredFXRendererContextTextures.m_motionVectors;
-      const auto* linearDepth = m_deferredFXRendererContextTextures.m_linearDepthTexture;
-
+      const auto* linearDepth = g_perFrame.LinearDepthTexture;
+      
       const bool dlss_inputs_valid =
          game_device_data.source_color_rtv.get() != nullptr &&
-         motionVectors &&
-         motionVectors->m_texture &&
-         motionVectors->m_texture->m_shaderResourceView &&
-         motionVectors->m_texture->m_renderTargetView &&
-         linearDepth &&
-         linearDepth->m_texture &&
-         linearDepth->m_texture->m_shaderResourceView &&
-         linearDepth->m_texture->m_depthStencilViews;
+            game_device_data.motion_vectors_rtv.get() != nullptr  &&
+            linearDepth &&
+            linearDepth->m_texture &&
+            linearDepth->m_texture->m_shaderResourceView &&
+            linearDepth->m_texture->m_depthStencilViews;
 
 #if DEVELOPMENT
       wd2_debug_info.execute_cmd_list = true;
       wd2_debug_info.source_color = (game_device_data.source_color_rtv.get() != nullptr);
-      wd2_debug_info.motion_vector = motionVectors &&
-                                     motionVectors->m_texture &&
-                                     motionVectors->m_texture->m_shaderResourceView &&
-                                     motionVectors->m_texture->m_renderTargetView;
+      wd2_debug_info.motion_vector = (game_device_data.motion_vectors_rtv.get() != nullptr);
       wd2_debug_info.depth_texture = linearDepth &&
                                      linearDepth->m_texture &&
                                      linearDepth->m_texture->m_shaderResourceView &&
@@ -1079,46 +1029,36 @@ public:
          {
             color_resource->QueryInterface(game_device_data.source_color.put());
          }
+         
+         ComPtr<ID3D11Resource> motion_vector_resource;
+         game_device_data.motion_vectors_rtv->GetResource(motion_vector_resource.put());
+         if (motion_vector_resource)
+         {
+            motion_vector_resource->QueryInterface(game_device_data.motion_vectors.put());
+         }
       }
 
-      if (device_data.sr_type != SR::Type::None && !device_data.has_drawn_sr)
+      if (device_data.sr_type != SR::Type::None && !game_device_data.has_drawn_upscaling)
       {
-         game_device_data.CameraSpaceToPreviousProjectedSpace = ComputeCameraSpaceToPreviousProjectedSpaceMatrix();
-         game_device_data.PreviousViewRotProjectionMatrix = ComputePreviousViewRotProjectionMatrix();
-
          //CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaSettings);
 
          auto* sr_instance_data = device_data.GetSRInstanceData();
          {
             SR::SettingsData settings_data;
-            settings_data.output_width = m_viewportPrivateData->m_viewportSize[0];
-            settings_data.output_height = m_viewportPrivateData->m_viewportSize[1];
-            settings_data.render_width = m_viewportPrivateData->m_viewportSize[0];
-            settings_data.render_height = m_viewportPrivateData->m_viewportSize[1];
+            settings_data.output_width = g_perFrame.RenderResolutionInt.x;
+            settings_data.output_height = g_perFrame.RenderResolutionInt.y;
+            settings_data.render_width = g_perFrame.RenderResolutionInt.x;
+            settings_data.render_height = g_perFrame.RenderResolutionInt.y;
             settings_data.dynamic_resolution = false;
             settings_data.hdr = true;
             settings_data.inverted_depth = true;
             settings_data.mvs_jittered = false;
             settings_data.auto_exposure = device_data.sr_type != SR::Type::FSR;
-            settings_data.mvs_x_scale = -(float)m_viewportPrivateData->m_viewportSize[0];
-            settings_data.mvs_y_scale = -(float)m_viewportPrivateData->m_viewportSize[1];
+            settings_data.mvs_x_scale = -g_perFrame.RenderResolution.x;
+            settings_data.mvs_y_scale = -g_perFrame.RenderResolution.y;
             settings_data.render_preset = dlss_render_preset;
             sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
-         }
-
-         {
-            //device_data.force_reset_sr = false;
-            bool is_camera_cut = false;
-            DirectX::XMVECTOR cam_dir_prev = m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_cameraMatrix.m_viewMatrix.r[1];
-            DirectX::XMVECTOR cam_dir_curr = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_cameraMatrix.m_viewMatrix.r[1];
-            float dot = DirectX::XMVectorGetX(DirectX::XMVector3Dot(cam_dir_prev, cam_dir_curr));
-            is_camera_cut = dot < 0.80000001;
-
-            device_data.force_reset_sr = device_data.force_reset_sr || is_camera_cut;
-
-            projection_jitters.x = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_jitter[0] * (float)m_viewportPrivateData->m_viewportSize[0];
-            projection_jitters.y = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_jitter[1] * (float)m_viewportPrivateData->m_viewportSize[1];
          }
 
          D3D11_TEXTURE2D_DESC taa_output_texture_desc;
@@ -1129,8 +1069,8 @@ public:
 
          {
             D3D11_TEXTURE2D_DESC dlss_output_texture_desc = taa_output_texture_desc;
-            dlss_output_texture_desc.Width = m_viewportPrivateData->m_viewportSize[0];
-            dlss_output_texture_desc.Height = m_viewportPrivateData->m_viewportSize[1];
+            dlss_output_texture_desc.Width = g_perFrame.RenderResolutionInt.x;
+            dlss_output_texture_desc.Height = g_perFrame.RenderResolutionInt.y;
             dlss_output_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
             ComPtr<ID3D11Device> native_device;
@@ -1158,7 +1098,18 @@ public:
             if (CreateMVResources(native_device.get(), game_device_data))
             {
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData);
-               ID3D11ShaderResourceView* srvs[] = {m_deferredFXRendererContextTextures.m_motionVectors->m_texture->m_shaderResourceView, m_deferredFXRendererContextTextures.m_linearDepthTexture->m_texture->m_shaderResourceView};
+               
+               if (!game_device_data.motion_vectors_srv.get())
+               {
+                  D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+                  srv_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+                  srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                  srv_desc.Texture2D.MostDetailedMip = 0;
+                  srv_desc.Texture2D.MipLevels = 1;
+                  native_device->CreateShaderResourceView(game_device_data.motion_vectors.get(), &srv_desc, game_device_data.motion_vectors_srv.put());
+               }
+               
+               ID3D11ShaderResourceView* srvs[] = {game_device_data.motion_vectors_srv.get(), g_perFrame.LinearDepthTexture->m_texture->m_shaderResourceView};
                ID3D11UnorderedAccessView* uavs[] = {game_device_data.decoded_motion_vectors_uav.get(), game_device_data.unjittered_depth_uav.get()};
                ID3D11Buffer* buffers[] = {game_device_data.viewport_cbv.get()};
                ID3D11SamplerState* samplers[] = {game_device_data.depth_sampler.get()};
@@ -1173,7 +1124,7 @@ public:
                native_device_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
                native_device_context->CSSetSamplers(0, 1, samplers);
 
-               native_device_context->Dispatch((m_viewportPrivateData->m_viewportSize[0] + 7) / 8, (m_viewportPrivateData->m_viewportSize[1] + 7) / 8, 1);
+               native_device_context->Dispatch((g_perFrame.RenderResolutionInt.x + 7) / 8, (g_perFrame.RenderResolutionInt.y + 7) / 8, 1);
 
                uavs[0] = nullptr;
                uavs[1] = nullptr;
@@ -1196,38 +1147,28 @@ public:
             draw_data.source_color = game_device_data.source_color.get();
             draw_data.output_color = device_data.sr_output_color.get();
             draw_data.motion_vectors = game_device_data.decoded_motion_vectors.get();
-            draw_data.depth_buffer = m_deferredFXRendererContextTextures.m_linearDepthTexture->m_texture->m_nativeTexture; //game_device_data.depth_texture.get();
+            draw_data.depth_buffer = g_perFrame.LinearDepthTexture->m_texture->m_nativeTexture; //game_device_data.depth_texture.get();
             draw_data.pre_exposure = 0.0f;
-            draw_data.render_width = m_viewportPrivateData->m_viewportSize[0];
-            draw_data.render_height = m_viewportPrivateData->m_viewportSize[1];
-            draw_data.jitter_x = projection_jitters.x;
-            draw_data.jitter_y = -projection_jitters.y;
+            draw_data.render_width = g_perFrame.RenderResolutionInt.x;
+            draw_data.render_height = g_perFrame.RenderResolutionInt.y;
+            draw_data.jitter_x = g_perFrame.CurrJitters.x;
+            draw_data.jitter_y = -g_perFrame.CurrJitters.y;
             draw_data.vert_fov = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_FOV;
             draw_data.far_plane = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_farClipDistance;
             draw_data.near_plane = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_camera.m_nearClipDistance;
-            draw_data.reset = device_data.force_reset_sr;
+            draw_data.reset = !game_device_data.has_previous_frame_history || g_perFrame.IsCameraCut;
             draw_data.frame_index = m_viewportPrivateData->m_renderCounter;
             draw_data.time_delta = m_viewportPrivateData->m_motionBlur.m_lastGameDeltaTime;
 
             bool dlss_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
-
+            game_device_data.has_drawn_upscaling = dlss_succeeded;
+            
 #if DEVELOPMENT
             wd2_debug_info.dlss_drawn = dlss_succeeded;
 #endif
-
-            if (dlss_succeeded)
-            {
-               device_data.has_drawn_sr = true;
-               device_data.force_reset_sr = false;
-            }
-            else
-            {
-               device_data.has_drawn_sr = false;
-               device_data.force_reset_sr = true;
-            }
          }
 
-         if (device_data.has_drawn_sr)
+         if (game_device_data.has_drawn_upscaling)
          {
             if (game_device_data.postfx_mask_rtv.get())
             {
@@ -1246,20 +1187,20 @@ public:
             D3D11_VIEWPORT viewport;
             viewport.TopLeftX = 0;
             viewport.TopLeftY = 0;
-            viewport.Width = static_cast<float>(m_viewportPrivateData->m_viewportSize[0]);
-            viewport.Height = static_cast<float>(m_viewportPrivateData->m_viewportSize[1]);
+            viewport.Width = g_perFrame.RenderResolution.x;
+            viewport.Height = g_perFrame.RenderResolution.y;
             viewport.MinDepth = 0;
             viewport.MaxDepth = 1;
             native_device_context->RSSetViewports(1, &viewport); // Viewport is always needed
             ID3D11ShaderResourceView* srvs[] = {game_device_data.unjittered_depth_srv.get(), game_device_data.decoded_motion_vectors_srv.get(), game_device_data.unjittered_postfx_mask_srv.get()};
-            ID3D11RenderTargetView* rtvs[] = {m_deferredFXRendererContextTextures.m_motionVectors->m_texture->m_renderTargetView, game_device_data.postfx_mask_rtv.get()};
+            ID3D11RenderTargetView* rtvs[] = {game_device_data.motion_vectors_rtv.get(), game_device_data.postfx_mask_rtv.get()};
             ID3D11Buffer* buffers[] = {game_device_data.viewport_cbv.get()};
             ID3D11SamplerState* samplers[] = {game_device_data.depth_sampler.get()};
             native_device_context->PSSetConstantBuffers(0, 1, buffers);
             native_device_context->PSSetShaderResources(0, 3, srvs);
             native_device_context->PSSetSamplers(0, 1, samplers);
             native_device_context->OMSetDepthStencilState(game_device_data.depth_stencil_state.get(), 0);
-            native_device_context->OMSetRenderTargets(2, rtvs, m_deferredFXRendererContextTextures.m_linearDepthTexture->m_texture->m_depthStencilViews[0][0].get());
+            native_device_context->OMSetRenderTargets(2, rtvs, g_perFrame.LinearDepthTexture->m_texture->m_depthStencilViews[0][0].get());
 
             auto vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
             auto ps = device_data.native_pixel_shaders[CompileTimeStringHash("Unjitter Depth")].get();
@@ -1306,7 +1247,7 @@ public:
                native_device_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
                native_device_context->CSSetShaderResources(0, 1, srvs);
 
-               native_device_context->Dispatch((m_viewportPrivateData->m_viewportSize[0] + 7) / 8, (m_viewportPrivateData->m_viewportSize[1] + 7) / 8, 1);
+               native_device_context->Dispatch((g_perFrame.RenderResolutionInt.x + 7) / 8, (g_perFrame.RenderResolutionInt.y + 7) / 8, 1);
             }
 
             native_device_context->CopyResource(game_device_data.source_color.get(), device_data.sr_output_color.get());
@@ -1370,33 +1311,7 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       
-      memcpy(&data.GameData.CameraSpaceToPreviousProjectedSpace, &game_device_data.CameraSpaceToPreviousProjectedSpace, sizeof(game_device_data.CameraSpaceToPreviousProjectedSpace));
-      
-      if (m_viewportPrivateData != nullptr)
-      {
-         DirectX::XMMATRIX prev_view_rot_proj = ComputePreviousViewRotProjectionMatrix();
-         memcpy(&data.GameData.PreviousViewRotProjectionMatrix, &prev_view_rot_proj, sizeof(game_device_data.PreviousViewRotProjectionMatrix));
-      }
-      
-      if (m_viewportPrivateData != nullptr)
-      {
-         data.GameData.PreviousCameraPosition = {
-            m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_position[0],
-            m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_position[1],
-            m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_camera.m_position[2],
-            1.0,
-         };
-         
-         float2 jitter = {0.0, 0.0};
-         jitter.x = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_jitter[0] * (float)m_viewportPrivateData->m_viewportSize[0];
-         jitter.y = m_viewportPrivateData->m_motionBlur.m_lastCurrentCamera.m_jitter[1] * (float)m_viewportPrivateData->m_viewportSize[1];
-         data.GameData.CurrJitters = jitter;
-         
-         jitter.x = m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_jitter[0] * (float)m_viewportPrivateData->m_viewportSize[0];
-         jitter.y = m_viewportPrivateData->m_motionBlur.m_lastPreviousCamera.m_jitter[1] * (float)m_viewportPrivateData->m_viewportSize[1];
-         data.GameData.PrevJitters = jitter;
-      }
-      
+      memcpy(&data.GameData.CurrJitters, &g_perFrame.CurrJitters, sizeof(CB::LumaGameData));
    }
    
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -1404,16 +1319,8 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       
 #if DEVELOPMENT
-      if (m_viewportPrivateData != nullptr)
-      {
-         wd2_debug_info.render_resolution.x = m_viewportPrivateData->m_viewportSize[0];
-         wd2_debug_info.render_resolution.y = m_viewportPrivateData->m_viewportSize[1];
-      }
-      else
-      {
-         wd2_debug_info.render_resolution.x = 0;
-         wd2_debug_info.render_resolution.y = 0;
-      }
+      wd2_debug_info.render_resolution.x = g_perFrame.RenderResolutionInt.x;
+      wd2_debug_info.render_resolution.y = g_perFrame.RenderResolutionInt.y;
       
       wd2_debug_info.jitters.x = jit[0].x;
       wd2_debug_info.jitters.y = jit[0].y;
@@ -1430,7 +1337,7 @@ public:
       wd2_debug_info.get_shared_texture = GetExistingSharedTexture != nullptr;
       wd2_debug_info.reset = false;
 #endif
-      
+
       if (device_data.sr_type != SR::Type::None)
       {
          if (GetAAOption() != OPTION_SMAA_T2X)
@@ -1450,7 +1357,7 @@ public:
          std::shared_lock shared_lock_samplers(s_mutex_samplers);
          if (device_data.sr_type != SR::Type::None && !device_data.sr_suppressed)
          {
-            device_data.texture_mip_lod_bias_offset = SR::GetMipLODBias((float)m_viewportPrivateData->m_viewportSize[1], (float)m_viewportPrivateData->m_viewportSize[1]); // This results in -1 at output res
+            device_data.texture_mip_lod_bias_offset = SR::GetMipLODBias(g_perFrame.RenderResolution.y, g_perFrame.RenderResolution.y); // This results in -1 at output res
          }
          else
          {
@@ -1467,8 +1374,14 @@ public:
          //std::lock_guard<std::mutex> lock(game_device_data.game_device_data_mutex);
          game_device_data.source_color.reset();
          game_device_data.source_color_srv.reset();
+         game_device_data.source_color_rtv.reset();
+         game_device_data.motion_vectors.reset();
+         game_device_data.motion_vectors_srv.reset();
+         game_device_data.motion_vectors_rtv.reset();
          game_device_data.viewport_cbv.reset();
          game_device_data.postfx_mask_rtv.reset();
+         game_device_data.has_previous_frame_history = !bIsNetHackingRendering && game_device_data.has_drawn_upscaling;
+         game_device_data.has_drawn_upscaling = false;
          ZeroTimeDelta = false;
          
          CDeferredFxAntialiasRenderer = 0;
@@ -1478,29 +1391,14 @@ public:
          m_viewportParamProvider = nullptr;
          m_deferredFxAntialiasRenderer = nullptr;
          m_currDeferredFXAntialiasFrameTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_currFrameTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_linearDepthTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_smallDepthColorTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_depthStencilSurface = nullptr;
-         m_deferredFXRendererContextTextures.m_motionVectors = nullptr;
-         m_deferredFXRendererContextTextures.m_normalsTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_gBufferAOTexture = nullptr;
-         m_deferredFXRendererContextTextures.m_fullAOTexture = nullptr;
          
-         motion_vector_contexts.clear();
+         g_perFrame.Reset();
          
          std::swap(game_device_data.prev_skin_lookup, game_device_data.skin_lookup);
          game_device_data.skin_lookup.clear();
          std::swap(game_device_data.prev_skin_buffer, game_device_data.skin_buffer);
          game_device_data.skin_buffer->Reset();
       }
-
-      if (!device_data.has_drawn_sr)
-      {
-         device_data.force_reset_sr = true;
-      }
-      
-      device_data.has_drawn_sr = false;
       
       device_data.cb_luma_global_settings_dirty = true;
       int32_t sr_type = static_cast<int32_t>(device_data.sr_type);
@@ -1902,6 +1800,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       g_deferred_fx_antialias_renderer_hook.reset();
       g_net_hacking_renderer_hook.reset();
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(WatchDogs2::OnExecuteSecondaryCommandList);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(WatchDogs2::OnClearRenderTargetView);
       //reshade::unregister_event<reshade::addon_event::create_pipeline>(WatchDogs2::OnCreatePipeline);
    }
 

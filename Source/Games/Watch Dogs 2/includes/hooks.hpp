@@ -111,6 +111,7 @@ struct CSceneViewportPrivateData
    unsigned int m_renderOnceFrameCount;
    unsigned int m_renderOnceMaxNumFrames;
    unsigned int m_renderCounter;
+   /*
    uint8_t unknown_field1[0x2C];
    CTexture* unknown_texture;
    uint8_t unknown_field2[0x20];
@@ -118,6 +119,7 @@ struct CSceneViewportPrivateData
    uint8_t unknown_field3[0x4];
    unsigned int m_TextureCount;
    CTexture* more_textures[10];
+   */
 };
 
 struct CShaderParameterMatrix44
@@ -180,6 +182,39 @@ struct CDeferredFxAntialiasRendererS
    unsigned int m_previousResetRequests; // 0xA4  (size 0x4)
 };
 
+struct PerFrame
+{
+   float2 CurrJitters;
+   float2 PrevJitters;
+   DirectX::XMMATRIX CameraSpaceToPreviousProjectedSpace;
+   DirectX::XMMATRIX PreviousViewRotProjectionMatrix;
+   float4 PreviousCameraPosition;  // W is dummy
+   DirectX::XMMATRIX ViewRotProjectionMatrix;
+   float2 RenderResolution;
+   int2 RenderResolutionInt;
+   CIndirectTexture* LinearDepthTexture;
+   bool IsCameraCut;
+   
+   void Reset()
+   {
+      CurrJitters = {0, 0};
+      PrevJitters = {0, 0};
+
+      CameraSpaceToPreviousProjectedSpace = DirectX::XMMatrixIdentity();
+      PreviousViewRotProjectionMatrix = DirectX::XMMatrixIdentity();
+      ViewRotProjectionMatrix = DirectX::XMMatrixIdentity();
+
+      PreviousCameraPosition = {0, 0, 0, 0};
+
+      RenderResolution = {0, 0};
+      RenderResolutionInt = {0, 0};
+      
+      LinearDepthTexture = nullptr;
+
+      IsCameraCut = false;
+   }
+};
+
 enum AAOptions {
    OPTION_NO_AA,
    OPTION_FXAA,
@@ -196,12 +231,13 @@ extern uintptr_t* m_deferredFXRendererContext;
 extern CSceneViewportPrivateData* m_viewportPrivateData;
 extern CViewportShaderParameterProvider* m_viewportParamProvider;
 extern CDeferredFxAntialiasRendererS* m_deferredFxAntialiasRenderer;
-extern CDeferredFxRendererContextTextures m_deferredFXRendererContextTextures;
+//extern CDeferredFxRendererContextTextures m_deferredFXRendererContextTextures;
 extern CTexture* m_currDeferredFXAntialiasFrameTexture;
 extern uintptr_t JitterTableOffset;
 bool ZeroTimeDelta;
+PerFrame g_perFrame;
 
-extern std::atomic<bool> bIsNetHackingRendering;
+extern bool bIsNetHackingRendering;
 
 AAOptions GetAAOption();
 //float GetGameDeltaTime();
@@ -211,4 +247,4 @@ using fnGetExistingSharedTexture = __int64(__fastcall*)(__int64 a1, unsigned int
 extern fnGetExistingSharedTexture GetExistingSharedTexture;
 
 __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintptr_t* a2);
-__int64 __fastcall Hooked_CNetHackingRendererPrepare(__int64 a1, __int64 a2, __int64 a3, __int64 a4, __int64 a5, __int64 a6, __int64 a7, __int64 a8);
+__int64 __fastcall Hooked_CNetHackingRendererPrepare(void* renderer, void* context, void* arg3, void* arg4, void* arg5, void* arg6, void* arg7, void* textureManager);
