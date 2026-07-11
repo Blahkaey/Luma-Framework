@@ -27,7 +27,21 @@ struct LumaGameSettings
    float Dithering;          // 0/1 toggle. Animated triangular dither at output (HDR only) to break gradient banding.
    float VideoAutoHDREnable; // 0/1. 1 = light PumboAutoHDR on Bink videos (HDR only); 0 = flat SDR at paper white.
    float VideoAutoHDRBoost;  // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
+
+   // RenoDX-feature port (append-only: GameSettings is the LumaSettings cbuffer tail, so new fields must go
+   // last to keep every existing offset stable; see cbuffers.h for the alignment rules).
+   float ColorGradingIntensity; // 1 = vanilla. HDR only: fades the game's ImageAdjustments+LUT grade (0 = ungraded scene; DoF/bloom/vignette/exposure stay).
+   float HDRHighlights;         // 1 = neutral. HDR only: luminance power curve above 18% mid-gray (>1 brightens, <1 compresses), pre-DICE.
+   float HDRShadows;            // 1 = neutral. HDR only: luminance power curve below 18% mid-gray (>1 lifts, <1 deepens), pre-DICE.
+   float HDRHueRestore;         // 0 = off. HDR only: restores the pre-DICE hue after display mapping (Oklab, hue channel only).
+   float FilmGrainStrength;     // 0 = off. Monochrome multiplicative film grain driven by linear luminance (SDR + HDR).
 };
+
+#ifdef __cplusplus
+// 17 floats, packed. HLSL packs the trailing struct members linearly, so the C++ raw size is the contract;
+// the containing LumaGlobalSettingsPadded handles the final 16-byte DX padding (cbuffers.h).
+static_assert(sizeof(LumaGameSettings) == 68, "LumaGameSettings layout drifted: append fields at the end only and keep this in sync");
+#endif
 
 // Game specific cbuffer (instance/pass) data.
 struct LumaGameData

@@ -57,6 +57,17 @@ static constexpr uint32_t kScaleformDigitGlyphHash2813 = 0x63898919;
 static constexpr uint32_t kScaleformMaskFillHash2873 = 0x616BEBBD;
 static constexpr uint32_t kScaleformDigitGlyphHash2873 = 0x79CDF7BA;
 
+// Cel-shading ("ink outline") edge-detection PS pair, matched against the native D3D9 pair RenoDX toggles
+// (0xD8E2DDE0 / 0xB902DF59) by DXBC fingerprint: 9 alpha-depth scene taps, Sobel axis/diagonal filter
+// constants at cb4[16..19] (native c8-c11), 8192/32 depth decode, alpha threshold 244/255. Pass 1 carries the
+// smoothstep literals (1.11111116/3/-2), pass 2 is the plain-saturate variant. The disabled branch in the
+// native shaders is clip(-1) with no writes, so skipping the draws is equivalent.
+// dgVoodoo 2.81.3 (ps_4_0), verified in both BL2 dumps:
+static constexpr uint32_t kCelShading1Hash2813 = 0xA5C353A5;
+static constexpr uint32_t kCelShading2Hash2813 = 0x936D1C83;
+// dgVoodoo 2.87.3 (ps_5_0) and TPS translations: unknown — needs dumps under those configurations. Until
+// then the Cel Shading toggle only affects BL2 under 2.81.3; do NOT reuse the native RenoDX hashes here.
+
 // XeGTAO replaces the dgVoodoo 2.81.3 occlusion pass and skips its two blur passes. Depth setup and
 // composition remain unchanged.
 static constexpr uint32_t kAOOcclusionHash2813 = 0x09C9AD0F; // Occlusion PS -> hijacked by XeGTAO
@@ -85,6 +96,7 @@ static int g_dof_type = 0;                                             // DoF pa
 static float g_dof_radius = 9.f;                                       // DoF strength (full-res px @ 4K Gaussian blur extent). Default, users tune
 static bool g_xegtao_enable = true;                                    // replace the game's SSAO with XeGTAO (only engages when the game's AO setting is on)
 static float g_xegtao_intensity = 1.f;                                 // AO strength: lerp(1, AO, intensity) at the final denoise (1 = XeGTAO default)
+static bool g_cell_shading_enable = true;                              // the game's cel-shading ink-outline passes (off = skip the verified outline draws)
 
 struct Borderlands2GameDeviceData final : public GameDeviceData
 {
@@ -203,6 +215,10 @@ class Borderlands2 final : public Game
    static bool IsFXAA(const ShaderHashesList<OneShaderPerPipeline>& hashes)
    {
       return hashes.Contains(kFXAAResolveHash, reshade::api::shader_stage::pixel) || hashes.Contains(kFXAAResolveHash_v281, reshade::api::shader_stage::pixel);
+   }
+   static bool IsCelShadingPass(const ShaderHashesList<OneShaderPerPipeline>& hashes)
+   {
+      return hashes.Contains(kCelShading1Hash2813, reshade::api::shader_stage::pixel) || hashes.Contains(kCelShading2Hash2813, reshade::api::shader_stage::pixel);
    }
 
    static bool CreateImmutableCB(ID3D11Device* device, const void* data, UINT size, ComPtr<ID3D11Buffer>& out)
@@ -506,6 +522,12 @@ public:
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR), anti-banding on
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink videos (HDR only)
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // highlight-expansion strength (peak ~165 nits at 0.5)
+      // RenoDX-feature port controls. All neutral no-ops by default; see GameCBuffers.hlsl for semantics.
+      default_luma_global_game_settings.ColorGradingIntensity = 1.f; // full game grading (HDR only)
+      default_luma_global_game_settings.HDRHighlights = 1.f;         // neutral highlight response (HDR only)
+      default_luma_global_game_settings.HDRShadows = 1.f;            // neutral shadow response (HDR only)
+      default_luma_global_game_settings.HDRHueRestore = 0.f;         // no extra hue restoration (HDR only)
+      default_luma_global_game_settings.FilmGrainStrength = 0.f;     // film grain off (SDR + HDR)
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -1117,6 +1139,12 @@ public:
          }
       }
 
+      // Cel-shading toggle: drop the ink-outline draws when disabled. The native shaders' own disabled branch
+      // is clip(-1) with no writes (RenoDX shading1/shading2), so skipping is equivalent — no replacement
+      // shader or state cleanup needed, and re-enabling live just lets the next frame's draws through.
+      if (!g_cell_shading_enable && is_immediate && !is_custom_pass && IsCelShadingPass(original_shader_hashes))
+         return DrawOrDispatchOverrideType::Skip;
+
       // Track the LDR buffer (the tonemap's render target). The HUD draws onto it afterwards; the Hide UI
       // toggle uses this to recognize (and drop) those HUD draws.
       if (is_immediate && IsAnyTonemap(original_shader_hashes))
@@ -1275,6 +1303,20 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VignetteIntensity", gs.VignetteIntensity);
 
+      // RenoDX-feature port sliders. Clamp to the supported ranges so malformed old config values can't
+      // destabilize the shader math (missing keys keep the neutral in-memory defaults).
+      reshade::get_config_value(nullptr, PROJECT_NAME, "ColorGradingIntensity", gs.ColorGradingIntensity);
+      gs.ColorGradingIntensity = std::clamp(gs.ColorGradingIntensity, 0.f, 1.f);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "HDRHighlights", gs.HDRHighlights);
+      gs.HDRHighlights = std::clamp(gs.HDRHighlights, 0.f, 2.f);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "HDRShadows", gs.HDRShadows);
+      gs.HDRShadows = std::clamp(gs.HDRShadows, 0.f, 2.f);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "HDRHueRestore", gs.HDRHueRestore);
+      gs.HDRHueRestore = std::clamp(gs.HDRHueRestore, 0.f, 1.f);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "FilmGrainStrength", gs.FilmGrainStrength);
+      gs.FilmGrainStrength = std::clamp(gs.FilmGrainStrength, 0.f, 1.f);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "CellShadingEnable", g_cell_shading_enable);
+
       g_dof_type = 0; // default = vanilla game DoF
       reshade::get_config_value(nullptr, PROJECT_NAME, "DOFType", g_dof_type);
       g_dof_type = (g_dof_type != 0) ? 1 : 0; // normalize to the 0/1 binary (migrates a legacy saved 2 -> 1)
@@ -1367,6 +1409,54 @@ public:
          reshade::set_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
       }
 
+      if (ImGui::SliderFloat("Scene Grading", &gs.ColorGradingIntensity, 0.f, 1.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "ColorGradingIntensity", gs.ColorGradingIntensity);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Strength of the game's own color grading, HDR only (1 = vanilla, 0 = ungraded scene; bloom, DoF and vignette stay).");
+      if (DrawResetButton<float, false>(gs.ColorGradingIntensity, gd_def.ColorGradingIntensity, "ColorGradingIntensity"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "ColorGradingIntensity", gs.ColorGradingIntensity);
+      }
+
+      if (ImGui::SliderFloat("Highlights", &gs.HDRHighlights, 0.f, 2.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRHighlights", gs.HDRHighlights);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Brightness response above mid-gray, HDR only (1 = neutral; above 1 brightens highlights, below 1 compresses them).");
+      if (DrawResetButton<float, false>(gs.HDRHighlights, gd_def.HDRHighlights, "HDRHighlights"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRHighlights", gs.HDRHighlights);
+      }
+
+      if (ImGui::SliderFloat("Shadows", &gs.HDRShadows, 0.f, 2.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRShadows", gs.HDRShadows);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Brightness response below mid-gray, HDR only (1 = neutral; above 1 lifts shadows, below 1 deepens them).");
+      if (DrawResetButton<float, false>(gs.HDRShadows, gd_def.HDRShadows, "HDRShadows"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRShadows", gs.HDRShadows);
+      }
+
+      if (ImGui::SliderFloat("Hue Restore", &gs.HDRHueRestore, 0.f, 1.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRHueRestore", gs.HDRHueRestore);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Restores the original scene hue after HDR display mapping, HDR only (0 = off).");
+      if (DrawResetButton<float, false>(gs.HDRHueRestore, gd_def.HDRHueRestore, "HDRHueRestore"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "HDRHueRestore", gs.HDRHueRestore);
+      }
+
       if (ImGui::Checkbox("Luma HDR Bloom", &g_luma_bloom_enable))
       {
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
@@ -1430,6 +1520,18 @@ public:
       }
       ImGui::EndDisabled();
 
+      if (ImGui::SliderFloat("Film Grain", &gs.FilmGrainStrength, 0.f, 1.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "FilmGrainStrength", gs.FilmGrainStrength);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Animated perceptual film grain (0 = off). Monochrome and luminance-based; strongest in shadows and mid-tones.");
+      if (DrawResetButton<float, false>(gs.FilmGrainStrength, gd_def.FilmGrainStrength, "FilmGrainStrength"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "FilmGrainStrength", gs.FilmGrainStrength);
+      }
+
       bool dithering = gs.Dithering > 0.5f;
       if (ImGui::Checkbox("Dithering", &dithering))
       {
@@ -1462,6 +1564,12 @@ public:
          reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       }
       ImGui::EndDisabled();
+
+      ImGui::SeparatorText("Effects");
+      if (ImGui::Checkbox("Cel Shading", &g_cell_shading_enable))
+         reshade::set_config_value(nullptr, PROJECT_NAME, "CellShadingEnable", g_cell_shading_enable);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("The game's cel-shading ink outlines. Off = skip the outline passes.\nCurrently verified for Borderlands 2 under dgVoodoo 2.81.3 only; no effect elsewhere yet.");
 
       ImGui::SeparatorText("Ambient Occlusion");
       if (ImGui::Checkbox("XeGTAO Ambient Occlusion", &g_xegtao_enable))
@@ -1533,7 +1641,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
       Globals::SetGlobals(PROJECT_NAME, "Borderlands 2 & The Pre-Sequel Luma mod");
-      Globals::VERSION = 1;
+      Globals::VERSION = 2; // 2: RenoDX-feature port (scene grading, highlights/shadows/hue restore, flat-white LUT protection, cel-shading toggle, film grain)
 
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;

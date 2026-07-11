@@ -19,5 +19,5 @@ void main(
     float4 v12 : TEXCOORD7,
     out float4 o0 : SV_TARGET0)
 {
-   o0 = RunTonemap(v5, v6);
+   o0 = RunTonemap(v0, v5, v6);
 }

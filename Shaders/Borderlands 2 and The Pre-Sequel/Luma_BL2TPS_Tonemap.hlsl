@@ -5,9 +5,10 @@
 // and every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
 #include "Includes/Common.hlsl"             // game-local: LumaGameSettings (grade sliders) — keep FIRST
 #include "../Includes/Color.hlsl"           // BT709_To_BT2020 / BT2020_To_BT709
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
+#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip, RestoreHueAndChrominance
 #include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardScalable (max-channel compressor)
+#include "Includes/FilmGrain.hlsl"   // game-local: FilmGrain::Apply (needs Color.hlsl's GetLuminance)
 // clang-format on
 
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
@@ -82,9 +83,40 @@ cbuffer cb4 : register(b4)
 #define VignetteSettings                 cb4[21] // c13
 #define VignetteColor                    cb4[22] // c14
 
-// The tonemap grade. v5 = TEXCOORD0 (DOF radial/kernel coords in .zw), v6 = TEXCOORD1 (scene UV .xy, half-res DOF
-// UV .zw) — the only interpolators the body uses. Returns the final gamma-space color (o0.a is always 0).
-float4 RunTonemap(float4 v5, float4 v6)
+// ---- Flat-white LUT detector (adapted from RenoDX's LutWhiteClip — MIT, Copyright (c) 2025 Carlos Lopez Jr.) ----
+// Detects the game swapping in a flat all-white grading LUT (white flash / fade / death effects, where the
+// grade IS the effect): sample three texel centers (black corner, white corner, one interior texel) and
+// combine a uniformity weight (corner samples nearly equal) with a whiteness weight (min RGB component near
+// 1). Returns ~1 for a deliberate white wash, 0 for any normal grade — neutral and strongly graded LUTs both
+// keep a black corner near 0, which zeroes the whiteness weight.
+// NOTE: the LUT is a 256x16 16-slice 2D atlas — the interior sample is the true mid-gray texel
+// (middle slice, middle texel), NOT UV (0.5, 0.5) (that lands at red~0 on slice 8). Dimensions are queried so
+// the same math holds if a game variant ships a different atlas size.
+// Thresholds start at RenoDX's (0.01 uniformity, 0.98-1.0 whiteness); verify against captures before freezing.
+float ComputeFlatWhiteLutFade()
+{
+   float lutW, lutH;
+   t3.GetDimensions(lutW, lutH);
+   float sliceSize = lutH;                                      // square slices packed horizontally
+   float midSliceX = floor(lutW / sliceSize * 0.5) * sliceSize; // first texel column of the middle slice
+   float midTexel = sliceSize * 0.5;                            // middle texel index within a slice
+   float2 uvBlack = float2(0.5 / lutW, 0.5 / lutH);
+   float2 uvWhite = float2(1.0 - 0.5 / lutW, 1.0 - 0.5 / lutH);
+   float2 uvMid = float2((midSliceX + midTexel + 0.5) / lutW, (midTexel + 0.5) / lutH);
+   float3 a = t3.SampleLevel(s3_s, uvBlack, 0).rgb;
+   float3 b = t3.SampleLevel(s3_s, uvWhite, 0).rgb;
+   float3 c = t3.SampleLevel(s3_s, uvMid, 0).rgb;
+   float3 delta = abs(a - b);
+   float uniformFade = 1.0 - smoothstep(0.0, 0.01, max(delta.r, max(delta.g, delta.b)));
+   float3 minRGB = min(a, min(b, c));
+   float whiteFade = smoothstep(0.98, 1.0, min(minRGB.r, min(minRGB.g, minRGB.b)));
+   return uniformFade * whiteFade;
+}
+
+// The tonemap grade. v0 = SV_Position (pixel coords, film-grain spatial seed), v5 = TEXCOORD0 (DOF
+// radial/kernel coords in .zw), v6 = TEXCOORD1 (scene UV .xy, half-res DOF UV .zw) — the only interpolators
+// the body uses. Returns the final gamma-space color (o0.a is always 0).
+float4 RunTonemap(float4 v0, float4 v5, float4 v6)
 {
    float4 o;
    float4 r0, r1, r2, r3;
@@ -207,6 +239,11 @@ float4 RunTonemap(float4 v5, float4 v6)
    // User Vignette Intensity: lerp between the pre-vignette color and the vignetted result (1 = vanilla, 0 = none).
    r0.xyz = lerp(vignette_color, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
 
+   // Compressed linear scene after vignette, before the game's grade: the "Scene Grading = 0" endpoint.
+   // Captured by NAME at the source location — r0.xyz here IS the vignetted compressed color; never re-derive
+   // this from decompiler swizzles of another layout (a past attempt captured the wrong component order).
+   float3 pre_grade_compressed = r0.xyz;
+
    // --- ImageAdjustments per-channel curve (verbatim; keep swizzles exactly) ---
    r1 = r0.zzxy + -ImageAdjustments2.z;
    r1 = saturate(r1 * 10000);
@@ -255,7 +292,38 @@ float4 RunTonemap(float4 v5, float4 v6)
 
    if (LumaSettings.DisplayMode == 1) // HDR
    {
-      float3 recovered = sdr_lin / max(tm, 1e-6); // exact inverse of the pre-grade compression -> HDR range (linear BT.709)
+      // --- Scene Grading (HDR only; 1 = vanilla, blend skipped so the neutral path stays bit-identical) ---
+      // Fade only the game's ImageAdjustments+LUT contribution by blending in COMPRESSED linear space between
+      // the pre-grade scene (DoF/bloom/light shafts/exposure/vignette applied) and the graded result; the
+      // exact /tm inverse below then recovers HDR range for either endpoint. SDR always keeps the full grade.
+      float3 mixed_compressed = sdr_lin;
+      const float sceneGrading = LumaSettings.GameSettings.ColorGradingIntensity;
+      if (sceneGrading < 1.0)
+         mixed_compressed = lerp(pre_grade_compressed, sdr_lin, saturate(sceneGrading));
+
+      float3 recovered = mixed_compressed / max(tm, 1e-6); // exact inverse of the pre-grade compression -> HDR range (linear BT.709)
+
+      // --- Highlights / Shadows (HDR only; 1/1 = neutral, skipped) ---
+      // Hue-preserving luminance reshape around 18% mid-gray: pivoted power curves that meet exactly at the
+      // pivot. Above it the exponent is HDRHighlights (>1 brightens/expands, <1 compresses); below it the
+      // exponent is 2 - HDRShadows (>1 lifts, <1 deepens). Exponents are floored to stay positive, and RGB is
+      // scaled by newLuminance/oldLuminance so hue is untouched. Runs pre-DICE, so the result stays
+      // display-independent (deliberately NOT mapped onto DICE's shoulder-start).
+      const float hdrHighlights = LumaSettings.GameSettings.HDRHighlights;
+      const float hdrShadows = LumaSettings.GameSettings.HDRShadows;
+      if (hdrHighlights != 1.0 || hdrShadows != 1.0)
+      {
+         float y = GetLuminance(recovered);
+         if (y > 1e-6)
+         {
+            float ratio = y / MidGray;
+            float exponent = (ratio > 1.0) ? max(hdrHighlights, 0.05) : max(2.0 - hdrShadows, 0.05);
+            float3 shaped = recovered * ((MidGray * pow(ratio, exponent)) / y);
+            recovered = (shaped == shaped) ? shaped : recovered; // sanitize before DICE (drop non-finite, keep the unshaped color)
+         }
+      }
+
+      float3 pre_dice_color = recovered; // hue reference for Hue Restore (post-shaping, pre display mapping)
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance preserves hue; the
       // *_CORRECT_CHANNELS_BEYOND_PEAK_WHITE type additionally gamut-maps any single channel that rides past peak
@@ -267,6 +335,14 @@ float4 RunTonemap(float4 v5, float4 v6)
       float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;
 
       // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
+      // Hue Restore (0 = off, skipped): Oklab hue-only restoration toward the pre-DICE scene color, correcting
+      // DICE/gamut-map hue drift. Runs BEFORE the desaturation/saturation/contrast controls below so they
+      // operate on the corrected color; chrominance and lightness restoration stay disabled (no out-of-range
+      // luminance/chroma is reintroduced).
+      const float hueRestore = LumaSettings.GameSettings.HDRHueRestore;
+      if (hueRestore > 0.0)
+         hdr = RestoreHueAndChrominance(hdr, pre_dice_color, hueRestore, 0.0);
+
       // Highlight desaturation: bright sources fade toward white as luminance approaches peak (eye/sensor
       // saturation). exponent in [1,0.05] keeps mid-tones colored; only luminance->peak whitens.
       const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
@@ -287,6 +363,31 @@ float4 RunTonemap(float4 v5, float4 v6)
    {
       postProcessedColor = sdr_lin;
    }
+
+   // --- Film grain (SDR + HDR; 0 = off, skipped) ---
+   // Applied after tone/grade processing, in linear before the UI pre-scale / gamma encode / dithering below.
+   // The later-composited HUD is untouched. Seeded by pixel position + FrameIndex (see FilmGrain.hlsl).
+   const float filmGrainStrength = LumaSettings.GameSettings.FilmGrainStrength;
+   if (filmGrainStrength > 0.0)
+      postProcessedColor = FilmGrain::Apply(postProcessedColor, v0.xy, LumaSettings.FrameIndex, filmGrainStrength);
+
+   // --- Flat-white LUT protection (HDR only, automatic) ---
+   // When the game swaps in a flat all-white LUT the grade IS the effect: blend back toward the decoded game
+   // LUT result so white flashes/fades sit at game paper white instead of being reconstructed toward display
+   // peak. Applied after film grain so intentional white fades stay clean.
+   float flatWhiteLutFade = 0.0;
+   if (LumaSettings.DisplayMode == 1)
+   {
+      flatWhiteLutFade = ComputeFlatWhiteLutFade();
+      if (flatWhiteLutFade > 0.0)
+         postProcessedColor = lerp(postProcessedColor, sdr_lin, flatWhiteLutFade);
+   }
+#if DEVELOPMENT
+   // Detector visualization (dev-only, never ships): DevSetting01 > 0 overlays the fade as magenta so every
+   // trigger can be tied to an actual game effect while capture-testing the thresholds.
+   if (LumaSettings.DisplayMode == 1 && LumaSettings.DevSetting01 > 0.0)
+      postProcessedColor = lerp(postProcessedColor, float3(flatWhiteLutFade, 0.0, flatWhiteLutFade), LumaSettings.DevSetting01);
+#endif
 
 #if UI_DRAW_TYPE >= 2
    // Pre-scale so the gamma-SDR HUD drawn on top (not pre-scaled) lands at UIPaperWhite after the composition
