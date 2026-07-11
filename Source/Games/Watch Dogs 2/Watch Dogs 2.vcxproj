@@ -306,6 +306,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="includes\safetyhook.hpp" />
+    <ClInclude Include="includes\shader_patches.h" />
     <ClInclude Include="includes\stretchy_buffer.hpp" />
     <ClInclude Include="includes\Zydis.h" />
   </ItemGroup>
