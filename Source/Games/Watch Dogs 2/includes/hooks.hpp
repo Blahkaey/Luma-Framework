@@ -193,6 +193,8 @@ struct PerFrame
    float2 RenderResolution;
    int2 RenderResolutionInt;
    CIndirectTexture* LinearDepthTexture;
+   float ExposureScale;
+   float MeasuredExposureScale;
    bool IsCameraCut;
    
    void Reset()
@@ -210,6 +212,9 @@ struct PerFrame
       RenderResolutionInt = {0, 0};
       
       LinearDepthTexture = nullptr;
+      
+      ExposureScale = 1.0;
+      MeasuredExposureScale = 1.0;
 
       IsCameraCut = false;
    }

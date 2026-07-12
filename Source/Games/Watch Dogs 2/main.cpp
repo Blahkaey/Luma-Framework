@@ -1180,7 +1180,7 @@ public:
             draw_data.output_color = game_device_data.resolve_texture.get();
             draw_data.motion_vectors = game_device_data.decoded_motion_vectors.get();
             draw_data.depth_buffer = g_perFrame.LinearDepthTexture->m_texture->m_nativeTexture; //game_device_data.depth_texture.get();
-            draw_data.pre_exposure = 0.0f;
+            draw_data.pre_exposure = g_perFrame.ExposureScale;
             draw_data.render_width = g_perFrame.RenderResolutionInt.x;
             draw_data.render_height = g_perFrame.RenderResolutionInt.y;
             draw_data.jitter_x = g_perFrame.CurrJitters.x;

@@ -180,6 +180,9 @@ __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintpt
             float dot = DirectX::XMVectorGetX(DirectX::XMVector3Dot(cam_dir_prev, cam_dir_curr));
             g_perFrame.IsCameraCut = dot < 0.80000001;
             
+            g_perFrame.ExposureScale = *reinterpret_cast<float*>(a2[8] + 0xD20);
+            g_perFrame.MeasuredExposureScale = *reinterpret_cast<float*>(a2[8] + 0xD40);
+            
             g_perFrame.LinearDepthTexture = reinterpret_cast<CIndirectTexture*>(a2[1]);
          }
       }
