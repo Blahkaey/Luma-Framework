@@ -96,8 +96,6 @@ namespace
       uint32_t u;
       std::byte b[4];
    };
-
-   float2 projection_jitters = {0, 0};
    
    float2 jit[2] = {
       {0, 0}, {0, 0}
@@ -136,8 +134,6 @@ namespace
 #if HDR_ENABLED
    ShaderHashesList shader_hashes_ColorGradingLUT;
 #endif
-   
-   std::shared_mutex materials_mutex;
 }
 
 struct GameDeviceDataWatchDogs2 final : public GameDeviceData
@@ -159,7 +155,9 @@ struct GameDeviceDataWatchDogs2 final : public GameDeviceData
    CachedRenderTargetResource cached_motion_vectors;
    
    ComPtr<ID3D11Buffer> viewport_cbv;
-   ComPtr<ID3D11UnorderedAccessView> sr_output_color_uav;
+   
+   ComPtr<ID3D11Texture2D> resolve_texture;
+   ComPtr<ID3D11UnorderedAccessView> resolve_texture_uav;
    
    ComPtr<ID3D11Texture2D> decoded_motion_vectors;
    ComPtr<ID3D11ShaderResourceView> decoded_motion_vectors_srv;
@@ -800,6 +798,31 @@ public:
          reshade::log::message(reshade::log::level::info, s.str().c_str());
          return false;
       }
+      
+      {
+         D3D11_TEXTURE2D_DESC desc;
+         desc.Width = g_perFrame.RenderResolutionInt.x;
+         desc.Height = g_perFrame.RenderResolutionInt.y;
+         desc.Usage = D3D11_USAGE_DEFAULT;
+         desc.ArraySize = 1;
+         desc.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+         desc.SampleDesc.Count = 1;
+         desc.SampleDesc.Quality = 0;
+         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         desc.CPUAccessFlags = 0;
+         desc.MiscFlags = 0;
+         desc.MipLevels = 1;
+
+         native_device->CreateTexture2D(&desc, nullptr, game_device_data.resolve_texture.put());
+      }
+      
+      {
+         D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+         uav_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+         uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+         uav_desc.Texture2D.MipSlice = 0;
+         native_device->CreateUnorderedAccessView(game_device_data.resolve_texture.get(), &uav_desc, game_device_data.resolve_texture_uav.put());
+      }
 
       return true;
    }
@@ -954,7 +977,6 @@ public:
 
             previous_skin_set = true;
          }
-         //has_set_luma_cb_material = false;
          return DrawOrDispatchOverrideType::None;
       }
 
@@ -997,15 +1019,6 @@ public:
          {
             if (device_data.sr_type != SR::Type::None)
             {
-#if 0
-               ID3D11ShaderResourceView* srv[2];
-               native_device_context->PSGetShaderResources(1, 2, &srv[0]);
-               game_device_data.source_color_srv = srv[0];
-               game_device_data.motion_vectors_srv = srv[1];
-               //native_device_context->PSGetConstantBuffers(0, 1, game_device_data.viewport_cbv.put());
-               if (srv[0]) srv[0]->Release();
-               if (srv[1]) srv[1]->Release();
-#endif
                return DrawOrDispatchOverrideType::Skip;
             }
             return DrawOrDispatchOverrideType::None;
@@ -1017,15 +1030,6 @@ public:
             {
                native_device_context->OMGetRenderTargets(1, game_device_data.source_color_rtv.put(), nullptr);
                native_device_context->PSGetConstantBuffers(0, 1, game_device_data.viewport_cbv.put());
-            }
-            return DrawOrDispatchOverrideType::None;
-         }
-         
-         if (original_shader_hashes.Contains(shader_hashes_TemporalResolve))
-         {
-            if (device_data.sr_type != SR::Type::None)
-            {
-               return DrawOrDispatchOverrideType::Skip;
             }
             return DrawOrDispatchOverrideType::None;
          }
@@ -1079,7 +1083,7 @@ public:
             game_device_data.cached_source_color.texture->GetDesc(&game_device_data.cached_source_color.desc);
             
             D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
-            srv_desc.Format = game_device_data.cached_source_color.desc.Format;
+            srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;  // requires float format view
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Texture2D.MostDetailedMip = 0;
             srv_desc.Texture2D.MipLevels = 1;
@@ -1097,7 +1101,7 @@ public:
             game_device_data.cached_motion_vectors.texture->GetDesc(&game_device_data.cached_motion_vectors.desc);
             
             D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
-            srv_desc.Format = game_device_data.cached_motion_vectors.desc.Format;
+            srv_desc.Format = game_device_data.cached_motion_vectors.desc.Format;   // the format is float not typeless
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Texture2D.MostDetailedMip = 0;
             srv_desc.Texture2D.MipLevels = 1;
@@ -1107,7 +1111,6 @@ public:
 
       if (device_data.sr_type != SR::Type::None && !game_device_data.has_drawn_upscaling)
       {
-         //CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaSettings);
 
          auto* sr_instance_data = device_data.GetSRInstanceData();
@@ -1134,37 +1137,6 @@ public:
          bool dlss_output_changed = false;
 
          {
-            D3D11_TEXTURE2D_DESC dlss_output_texture_desc = taa_output_texture_desc;
-            dlss_output_texture_desc.Width = g_perFrame.RenderResolutionInt.x;
-            dlss_output_texture_desc.Height = g_perFrame.RenderResolutionInt.y;
-            dlss_output_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-
-            if (device_data.sr_output_color.get())
-            {
-               D3D11_TEXTURE2D_DESC prev_dlss_output_texture_desc;
-               device_data.sr_output_color->GetDesc(&prev_dlss_output_texture_desc);
-               dlss_output_changed = prev_dlss_output_texture_desc.Width != dlss_output_texture_desc.Width || prev_dlss_output_texture_desc.Height != dlss_output_texture_desc.Height || prev_dlss_output_texture_desc.Format != dlss_output_texture_desc.Format;
-            }
-
-            if (!device_data.sr_output_color.get() || dlss_output_changed)
-            {
-               device_data.sr_output_color = nullptr; // Make sure we discard the previous one
-               HRESULT hr = native_device->CreateTexture2D(&dlss_output_texture_desc, nullptr, &device_data.sr_output_color);
-               ASSERT_ONCE(SUCCEEDED(hr));
-               {
-                  D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc;
-                  uav_desc.Format = dlss_output_texture_desc.Format;
-                  uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-                  uav_desc.Texture2D.MipSlice = 0;
-                  native_device->CreateUnorderedAccessView(device_data.sr_output_color.get(), &uav_desc, game_device_data.sr_output_color_uav.put());
-               }
-            }
-
-            if (!device_data.sr_output_color.get())
-            {
-               skip_dlss = true;
-            }
-
             if (CreateMVResources(native_device, game_device_data))
             {
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData);
@@ -1173,10 +1145,10 @@ public:
                ID3D11UnorderedAccessView* uavs[] = {game_device_data.decoded_motion_vectors_uav.get(), game_device_data.unjittered_depth_uav.get()};
                ID3D11Buffer* buffers[] = {game_device_data.viewport_cbv.get()};
                ID3D11SamplerState* samplers[] = {game_device_data.depth_sampler.get()};
-               
+
                auto cs = ZeroTimeDelta ? 
-                                 device_data.native_compute_shaders[CompileTimeStringHash("Decode Motion Vector ZTD")].get() :
-                                 device_data.native_compute_shaders[CompileTimeStringHash("Decode Motion Vector")].get();
+                                          device_data.native_compute_shaders[CompileTimeStringHash("Decode Motion Vector ZTD")].get() : 
+                                          device_data.native_compute_shaders[CompileTimeStringHash("Decode Motion Vector")].get();
                
                native_device_context->CSSetShader(cs, nullptr, 0);
                native_device_context->CSSetShaderResources(0, 2, srvs);
@@ -1205,7 +1177,7 @@ public:
          {
             SR::SuperResolutionImpl::DrawData draw_data;
             draw_data.source_color = game_device_data.cached_source_color.texture.get();
-            draw_data.output_color = device_data.sr_output_color.get();
+            draw_data.output_color = game_device_data.resolve_texture.get();
             draw_data.motion_vectors = game_device_data.decoded_motion_vectors.get();
             draw_data.depth_buffer = g_perFrame.LinearDepthTexture->m_texture->m_nativeTexture; //game_device_data.depth_texture.get();
             draw_data.pre_exposure = 0.0f;
@@ -1273,10 +1245,9 @@ public:
             native_device_context->Draw(4, 0);
 
             //TODO: write luminance to alpha as required for exposure + post effects
-            if (game_device_data.sr_output_color_uav.get() != nullptr)
             {
                ID3D11ShaderResourceView* srvs[] = {game_device_data.cached_source_color.srv.get()};
-               ID3D11UnorderedAccessView* uavs[] = {game_device_data.sr_output_color_uav.get()};
+               ID3D11UnorderedAccessView* uavs[] = {game_device_data.resolve_texture_uav.get()};
                ID3D11Buffer* buffers[] = {game_device_data.viewport_cbv.get()};
                native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("Copy Luminance")].get(), nullptr, 0);
                native_device_context->CSSetConstantBuffers(0, 1, buffers);
@@ -1286,7 +1257,7 @@ public:
                native_device_context->Dispatch((g_perFrame.RenderResolutionInt.x + 7) / 8, (g_perFrame.RenderResolutionInt.y + 7) / 8, 1);
             }
 
-            native_device_context->CopyResource(game_device_data.cached_source_color.texture.get(), device_data.sr_output_color.get());
+            native_device_context->CopyResource(game_device_data.cached_source_color.texture.get(), game_device_data.resolve_texture.get());
          }
          draw_state_stack.Restore(native_device_context);
          compute_state_stack.Restore(native_device_context);
@@ -1345,8 +1316,6 @@ public:
    
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      
       memcpy(&data.GameData.CurrJitters, &g_perFrame.CurrJitters, sizeof(CB::LumaGameData));
    }
    
@@ -1407,12 +1376,7 @@ public:
       game_device_data.draw_device_context = nullptr;
       
       {
-         //std::lock_guard<std::mutex> lock(game_device_data.game_device_data_mutex);
-         //game_device_data.source_color.reset();
-         //game_device_data.source_color_srv.reset();
          game_device_data.source_color_rtv.reset();
-         //game_device_data.motion_vectors.reset();
-         //game_device_data.motion_vectors_srv.reset();
          game_device_data.motion_vectors_rtv.reset();
          game_device_data.viewport_cbv.reset();
          game_device_data.postfx_mask_rtv.reset();
@@ -1780,6 +1744,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          0x390E9FBC, // #GENERATE#ZERO_TIME_DELTA
          0x3BF6F7A1, // #GENERATE#ZERO_TIME_DELTA#NO_PREVIOUS_FRAME#DEBUG_INVALID_COLOURS
          0x47C700DB, // #GENERATE#ZERO_TIME_DELTA#NO_PREVIOUS_FRAME
+         0x4053E8B2, // #LUMINANCE_COPY
       };
       
       shader_hashes_WaterGridVectorMap.pixel_shaders = {
