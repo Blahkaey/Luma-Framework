@@ -200,3 +200,39 @@ __int64 __fastcall Hooked_CNetHackingRendererPrepare(void* renderer, void* conte
 
    return original_result;
 }
+#if 0
+HRESULT __fastcall Hooked_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restoreState, ID3D11CommandList** commandList)
+{
+   //reshade::log::message(reshade::log::level::info, std::format("ID3D11DeviceContext::FinishCommandList - restoreState = {}", restoreState).c_str());
+   HRESULT hr = FinishCommandList(ctx, restoreState, commandList);
+
+   auto bind = luma_buffer_bind_state.find(ctx);
+   if (bind != luma_buffer_bind_state.end())
+   {
+      if (restoreState)
+      {
+         bind->second.post_record_state = bind->second.pre_record_state;
+      }
+      else
+      {
+         bind->second.pre_record_state = bind->second.post_record_state;
+      }
+   }
+   
+   return hr;
+}
+
+void __fastcall Hooked_ClearState(ID3D11DeviceContext* context)
+{
+   //reshade::log::message(reshade::log::level::info, "ID3D11DeviceContext::ClearState");
+   ClearState(context);
+   
+   auto it = luma_buffer_bind_state.find(context);
+
+   if (it != luma_buffer_bind_state.end())
+   {
+      it->second.pre_record_state = false;
+      it->second.post_record_state = false;
+   }
+}
+#endif

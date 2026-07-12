@@ -222,8 +222,16 @@ enum AAOptions {
    OPTION_SMAA_T2X
 };
 
+struct DeferredContextBindState
+{
+   bool pre_record_state;
+   bool post_record_state;
+};
+
 inline SafetyHookInline g_deferred_fx_antialias_renderer_hook;
 inline SafetyHookInline g_net_hacking_renderer_hook;
+inline SafetyHookInline g_finnish_commandlist_hook;
+inline SafetyHookInline g_clear_state_hook;
 
 extern uintptr_t* AAOptionBase;
 extern uintptr_t CDeferredFxAntialiasRenderer;
@@ -234,6 +242,7 @@ extern CDeferredFxAntialiasRendererS* m_deferredFxAntialiasRenderer;
 //extern CDeferredFxRendererContextTextures m_deferredFXRendererContextTextures;
 extern CTexture* m_currDeferredFXAntialiasFrameTexture;
 extern uintptr_t JitterTableOffset;
+//extern std::unordered_map<ID3D11DeviceContext*, DeferredContextBindState> luma_buffer_bind_state;
 bool ZeroTimeDelta;
 PerFrame g_perFrame;
 
@@ -246,5 +255,17 @@ AAOptions GetAAOption();
 using fnGetExistingSharedTexture = __int64(__fastcall*)(__int64 a1, unsigned int a2);
 extern fnGetExistingSharedTexture GetExistingSharedTexture;
 
+using fnFinishCommandList = HRESULT(__fastcall*)(
+    ID3D11DeviceContext*,
+    BOOL,
+    ID3D11CommandList**
+);
+fnFinishCommandList FinishCommandList = nullptr;
+
+using fnClearState = void(__fastcall*)(ID3D11DeviceContext*);
+fnClearState ClearState = nullptr;
+
 __int64 __fastcall Hooked_CDeferredFxAntialiasRendererPrepare(__int64 a1, uintptr_t* a2);
 __int64 __fastcall Hooked_CNetHackingRendererPrepare(void* renderer, void* context, void* arg3, void* arg4, void* arg5, void* arg6, void* arg7, void* textureManager);
+//HRESULT __fastcall Hooked_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restoreState, ID3D11CommandList** commandList);
+//void __fastcall Hooked_ClearState(ID3D11DeviceContext* context);
