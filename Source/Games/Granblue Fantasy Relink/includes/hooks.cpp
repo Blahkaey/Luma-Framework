@@ -3,21 +3,77 @@
 #include "hooks.hpp"
 #include "common.hpp"
 
+bool ResolveGBFRAddresses()
+{
+   const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+   if (base == 0)
+      return false;
+
+   // Hook/function targets (code addresses)
+   g_resolved_addresses.initialize_dx11_rendering_pipeline = reinterpret_cast<void*>(base + kInitializeDX11RenderingPipeline_RVA);
+   g_resolved_addresses.dispatch_render_pass_viewport = reinterpret_cast<void*>(base + kDispatchRenderPassViewport_RVA);
+   g_resolved_addresses.ui_render_orchestrator = reinterpret_cast<void*>(base + kUIRenderOrchestrator_RVA);
+   g_resolved_addresses.jitter_write_site = reinterpret_cast<void*>(base + kJitterWrite_RVA);
+#ifdef PATCH_JITTER_TABLE_INIT
+   g_resolved_addresses.temporal_aa_component_init = reinterpret_cast<void*>(base + kTemporalAntiAliasingComponent_Init_RVA);
+#endif
+
+   // Data addresses
+   g_resolved_addresses.output_width = base + kOutputWidth_RVA;
+   g_resolved_addresses.output_height = base + kOutputHeight_RVA;
+   g_resolved_addresses.render_width = base + kRenderWidth_RVA;
+   g_resolved_addresses.render_height = base + kRenderHeight_RVA;
+   g_resolved_addresses.camera_index = base + kCameraIndex_RVA;
+   g_resolved_addresses.camera_table = base + kCameraTable_RVA;
+   g_resolved_addresses.taa_settings_global = base + kTAASettingsGlobal_RVA;
+   g_resolved_addresses.jitter_phase_counter = base + kJitterPhaseCounter_RVA;
+   g_resolved_addresses.jitter_phase_mask_cl_imm = base + kJitterPhaseMask_CL_RVA;
+   g_resolved_addresses.jitter_phase_mask_eax_imm = base + kJitterPhaseMask_EAX_RVA;
+#ifdef V1_3_2
+   g_resolved_addresses.camera_global = base + kCameraGlobal_RVA;
+#endif
+
+   return true;
+}
+
 bool TryReadCameraJitter(float2& out_jitter)
 {
-   const uintptr_t camera = ResolveGBFRDataOrFallback(
-      g_resolved_addresses.camera_global,
-      kCameraGlobal_RVA);
-   if (camera == 0)
-      return false;
+#ifdef V1_3_2
+   // OLD binary: CameraGlobal mechanism
+   if (g_resolved_addresses.camera_global != 0)
+   {
+      const uintptr_t camera = g_resolved_addresses.camera_global;
+      const uintptr_t projection_ptr = *reinterpret_cast<const uintptr_t*>(camera + kCameraProjectionDataOffset);
+      if (projection_ptr == 0)
+         return false;
 
-   const uintptr_t projection_ptr = *reinterpret_cast<const uintptr_t*>(camera + kCameraProjectionDataOffset);
-   if (projection_ptr == 0)
-      return false;
+      out_jitter.x = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterXOffset);
+      out_jitter.y = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterYOffset);
+      return true;
+   }
+#else
+   // NEW binary: CameraIndex + CameraTable mechanism
+   if (g_resolved_addresses.camera_index != 0 && g_resolved_addresses.camera_table != 0)
+   {
+      const int camera_idx = *reinterpret_cast<const int*>(g_resolved_addresses.camera_index);
+      if (camera_idx < 0 || camera_idx > 0xb)
+         return false;
 
-   out_jitter.x = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterXOffset);
-   out_jitter.y = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterYOffset);
-   return true;
+      const uintptr_t camera = *reinterpret_cast<const uintptr_t*>(
+         g_resolved_addresses.camera_table + static_cast<size_t>(camera_idx) * 8);
+      if (camera == 0)
+         return false;
+
+      const uintptr_t projection_ptr = *reinterpret_cast<const uintptr_t*>(camera + kCameraProjectionDataOffset);
+      if (projection_ptr == 0)
+         return false;
+
+      out_jitter.x = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterXOffset);
+      out_jitter.y = *reinterpret_cast<const float*>(projection_ptr + kProjectionJitterYOffset);
+      return true;
+   }
+#endif
+   return false;
 }
 
 void OnJitterWrite(safetyhook::Context& ctx)
@@ -85,8 +141,8 @@ void PatchJitterPhases()
 #ifndef PATCH_JITTER_TABLE_INIT
    constexpr uint8_t mask = static_cast<uint8_t>(JITTER_PHASES - 1);
    const uintptr_t patch_addrs[2] = {
-      ResolveGBFRDataOrFallback(g_resolved_addresses.jitter_phase_mask_cl_imm, kJitterPhaseMask_CL_RVA),
-      ResolveGBFRDataOrFallback(g_resolved_addresses.jitter_phase_mask_eax_imm, kJitterPhaseMask_EAX_RVA),
+      g_resolved_addresses.jitter_phase_mask_cl_imm,
+      g_resolved_addresses.jitter_phase_mask_eax_imm,
    };
    for (uintptr_t addr : patch_addrs)
    {
@@ -108,9 +164,7 @@ bool IsTAARunningThisFrame()
    static std::atomic<bool> s_last_taa_running{false};
 
    const bool last_known = s_last_taa_running.load(std::memory_order_acquire);
-   const uintptr_t settings_ptr_addr = ResolveGBFRDataOrFallback(
-      g_resolved_addresses.taa_settings_global,
-      kTAASettingsGlobal_RVA);
+   const uintptr_t settings_ptr_addr = g_resolved_addresses.taa_settings_global;
    if (settings_ptr_addr == 0)
       return last_known;
 
@@ -174,16 +228,10 @@ static char __fastcall Hooked_InitializeDX11RenderingPipeline(int screen_width, 
       // CreateRenderTargets initialises these from g_outputWidth/g_outputHeight (always output
       // dims) and never applies a scale, so without this write the frame graph sees
       // render == output and skips the temporal upscale path every frame.
-      const uintptr_t render_w_addr = ResolveGBFRDataOrFallback(
-         g_resolved_addresses.render_width,
-         kRenderWidth_RVA);
-      const uintptr_t render_h_addr = ResolveGBFRDataOrFallback(
-         g_resolved_addresses.render_height,
-         kRenderHeight_RVA);
-      if (render_w_addr != 0 && render_h_addr != 0)
+      if (g_resolved_addresses.render_width != 0 && g_resolved_addresses.render_height != 0)
       {
-         *reinterpret_cast<int*>(render_w_addr) = render_w;
-         *reinterpret_cast<int*>(render_h_addr) = render_h;
+         *reinterpret_cast<int*>(g_resolved_addresses.render_width) = render_w;
+         *reinterpret_cast<int*>(g_resolved_addresses.render_height) = render_h;
       }
    }
 

@@ -16,14 +16,18 @@ struct GBFRResolvedAddresses
    uintptr_t output_height = 0;
    uintptr_t render_width = 0;
    uintptr_t render_height = 0;
+
+   // NEW binary: CameraIndex + CameraTable mechanism
+   uintptr_t camera_index = 0;
+   uintptr_t camera_table = 0;
+   // OLD binary (V1_3_2): CameraGlobal pointer
+#ifdef V1_3_2
    uintptr_t camera_global = 0;
+#endif
    uintptr_t taa_settings_global = 0;
    uintptr_t jitter_phase_counter = 0;
    uintptr_t jitter_phase_mask_cl_imm = 0;
    uintptr_t jitter_phase_mask_eax_imm = 0;
-
-   bool resolve_attempted = false;
-   bool ready = false;
 };
 
 struct GBFRHookGlobals
@@ -55,28 +59,49 @@ struct GBFRHookGlobals
    std::atomic<uintptr_t> ui_render_ctx{0};
 };
 
+// New binary (PR #149, v2.0.2) RVAs — default build
 constexpr size_t kVSSetConstantBuffers1_VTableIndex = 119;
-constexpr uintptr_t kInitializeDX11RenderingPipeline_RVA = 0x00745510;
+constexpr uintptr_t kInitializeDX11RenderingPipeline_RVA = 0x007F9E10;
 constexpr uintptr_t kUpdateScreenResolution_RVA = 0x005F7960;
-constexpr uintptr_t kDispatchRenderPassViewport_RVA = 0x01BFF340; // GBFR_DispatchRenderPassViewport
+constexpr uintptr_t kDispatchRenderPassViewport_RVA = 0x022D0500; // GBFR_DispatchRenderPassViewport
 constexpr uintptr_t kUIRenderOrchestrator_RVA = 0x03222A10;       // sub_143222A10 — UI pipeline entry
-constexpr uintptr_t kOutputWidth_RVA = 0x05AA41E8;                // g_outputWidth  — read by the single caller of InitializeDX11RenderingPipeline (args = these globals)
-constexpr uintptr_t kOutputHeight_RVA = 0x05AA41EC;               // g_outputHeight — same
-constexpr uintptr_t kRenderWidth_RVA = 0x05AA41E0;                // g_renderWidth  — frame graph reads this to decide temporal upscale path; must equal the args passed to InitializeDX11RenderingPipeline
-constexpr uintptr_t kRenderHeight_RVA = 0x05AA41E4;               // g_renderHeight — same
-constexpr uintptr_t kCameraGlobal_RVA = 0x068B4F90;
+constexpr uintptr_t kOutputWidth_RVA = 0x06B84090;                // g_outputWidth  — 1920 (0x0780)
+constexpr uintptr_t kOutputHeight_RVA = 0x06B84094;               // g_outputHeight — 1080 (0x0438)
+constexpr uintptr_t kRenderWidth_RVA = 0x06B84088;                // g_renderWidth  — 1920
+constexpr uintptr_t kRenderHeight_RVA = 0x06B8408C;               // g_renderHeight — 1080
+constexpr uintptr_t kCameraIndex_RVA = 0x07021320;                // CameraIndex (new table-based mechanism)
+constexpr uintptr_t kCameraTable_RVA = 0x054BF400;                // CameraTable (array of camera pointers)
 constexpr uintptr_t kCameraProjectionDataOffset = 0x60;
 constexpr uintptr_t kProjectionJitterXOffset = 0x940;
 constexpr uintptr_t kProjectionJitterYOffset = 0x944;
-constexpr uintptr_t kTAASettingsGlobal_RVA = 0x05E55EA0;
-constexpr uintptr_t kJitterPhaseCounter_RVA = 0x05E61790;
-constexpr uintptr_t kJitterPhaseMask_CL_RVA = 0x01A9EB76;
-constexpr uintptr_t kJitterPhaseMask_EAX_RVA = 0x01A9EB7C;
-constexpr uintptr_t kJitterWrite_RVA = 0x01A9EB9B;
-constexpr uintptr_t kTemporalAntiAliasingComponent_Init_RVA = 0x01A9E5D0;
+constexpr uintptr_t kTAASettingsGlobal_RVA = 0x07032DE0;
+constexpr uintptr_t kJitterPhaseCounter_RVA = 0x0703F470;
+constexpr uintptr_t kJitterPhaseMask_CL_RVA = 0x02165876;   // JitterWrite + 0x3B
+constexpr uintptr_t kJitterPhaseMask_EAX_RVA = 0x0216587C;   // JitterWrite + 0x41
+constexpr uintptr_t kJitterWrite_RVA = 0x0216582D;
+constexpr uintptr_t kTemporalAntiAliasingComponent_Init_RVA = 0x02165260;
 constexpr uintptr_t kTAAJitterTableOffset = 0x28;
 constexpr uintptr_t kTAAJitterPhaseIndexOffset = 0x24; // this->jitter_phase_index; written by Trans at same time as camera write (mov [rsi+24h], cl @ 0x141A9EB77)
 constexpr size_t kTAAJitterTableCount = 64;
+
+// Old binary (v1.3.2) RVAs — used when V1_3_2 is defined
+#ifdef V1_3_2
+constexpr uintptr_t kInitializeDX11RenderingPipeline_RVA = 0x007455C2;
+constexpr uintptr_t kUpdateScreenResolution_RVA = 0x00593960;
+constexpr uintptr_t kDispatchRenderPassViewport_RVA = 0x01BFF340;
+constexpr uintptr_t kUIRenderOrchestrator_RVA = 0x03222A10;
+constexpr uintptr_t kOutputWidth_RVA = 0x068B4090;
+constexpr uintptr_t kOutputHeight_RVA = 0x068B4094;
+constexpr uintptr_t kRenderWidth_RVA = 0x068B4088;
+constexpr uintptr_t kRenderHeight_RVA = 0x068B408C;
+constexpr uintptr_t kCameraGlobal_RVA = 0x068B4F90;               // CameraGlobal (old mechanism)
+constexpr uintptr_t kTAASettingsGlobal_RVA = 0x06D32DE0;
+constexpr uintptr_t kJitterPhaseCounter_RVA = 0x06D3F470;
+constexpr uintptr_t kJitterPhaseMask_CL_RVA = 0x01A9EB76;
+constexpr uintptr_t kJitterPhaseMask_EAX_RVA = 0x01A9EB7C;
+constexpr uintptr_t kJitterWrite_RVA = 0x01A9EB6B;
+constexpr uintptr_t kTemporalAntiAliasingComponent_Init_RVA = 0x01A9E5D0;
+#endif
 
 inline GBFRHookGlobals g_hook_globals;
 inline auto& g_rt_creation_hook = g_hook_globals.rt_creation_hook;
@@ -94,8 +119,6 @@ inline auto& g_native_device_ptr = g_hook_globals.native_device_ptr;
 inline GBFRResolvedAddresses g_resolved_addresses;
 
 bool ResolveGBFRAddresses();
-uintptr_t ResolveGBFRDataOrFallback(uintptr_t resolved_absolute, uintptr_t fallback_rva);
-void* ResolveGBFRCodeOrFallback(void* resolved_absolute, uintptr_t fallback_rva);
 
 bool TryReadCameraJitter(float2& out_jitter);
 void OnJitterWrite(safetyhook::Context& ctx);
