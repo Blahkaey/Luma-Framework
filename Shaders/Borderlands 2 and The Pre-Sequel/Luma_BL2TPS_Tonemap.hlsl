@@ -7,6 +7,7 @@
 #include "../Includes/Color.hlsl"           // BT709_To_BT2020 / BT2020_To_BT709
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Oklab.hlsl"    // Oklab::linear_srgb_to_oklch (user Saturation chroma scale)
 #include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardScalable (max-channel compressor)
 // clang-format on
 
@@ -178,14 +179,27 @@ float4 RunTonemap(float4 v5, float4 v6)
    hdr_color *= LumaSettings.GameSettings.Exposure;
 
    // --- max-channel compress BEFORE grade+LUT (HDR only) ---
-   // tm = per-pixel uniform scale (<=1) that maps the brightest channel into [0,1] via a midgray-pinned Reinhard.
-   // One scale for all 3 channels => hue/chroma intact; brightest channel pinned <=1 => the vanilla-DOF-branch
-   // saturate and the 16-slice LUT never clip. SDR mode leaves tm=1 so the grade runs on the raw scene like vanilla.
+   // tm = per-pixel uniform scale (<=1) that maps the brightest channel into [0,1]. One scale for all 3 channels
+   // => hue/chroma intact; brightest channel pinned <=1 => the vanilla-DOF-branch saturate and the 16-slice LUT
+   // never clip. SDR mode leaves tm=1 so the grade runs on the raw scene like vanilla. Curve selection:
+   // 0 = ReinhardScalable, midgray-pinned (legacy: lifts shadows ~22% pre-LUT, vanilla-white graded at 0.55)
+   // 1 = Neutwo x/sqrt(x^2+1) (default: slope 1 at black, -1.6% at midgray, white -> 0.71; RenoDX BL2 parity)
+   // 2 = identity below 0.5 + DICE exponential shoulder (max vanilla fidelity, crowds the top LUT texels)
+#ifndef TONEMAP_COMPRESSION_TYPE
+#define TONEMAP_COMPRESSION_TYPE 1
+#endif
    float tm = 1.0;
    if (LumaSettings.DisplayMode == 1)
    {
       float mx = max(hdr_color.r, max(hdr_color.g, hdr_color.b));
+#if TONEMAP_COMPRESSION_TYPE == 2
+      const float shoulder = 0.5;
+      float mx_c = (mx <= shoulder) ? mx : DICE::LuminanceCompress(mx, 1.0, shoulder);
+#elif TONEMAP_COMPRESSION_TYPE == 1
+      float mx_c = mx * rsqrt(mx * mx + 1.0); // Neutwo (Naka-Rushton)
+#else
       float mx_c = Reinhard::ReinhardScalable(mx, 1.0, 0.0, MidGray, MidGray);
+#endif
       tm = (mx > 1e-6) ? (mx_c / mx) : 1.0;
    }
    r0.xyz = hdr_color * tm;
@@ -206,6 +220,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.xyz = (r0.w >= 0) ? r0.xyz : r1.xyz;
    // User Vignette Intensity: lerp between the pre-vignette color and the vignetted result (1 = vanilla, 0 = none).
    r0.xyz = lerp(vignette_color, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
+   float3 ungraded_vignetted = r0.xyz;
 
    // --- ImageAdjustments per-channel curve (verbatim; keep swizzles exactly) ---
    r1 = r0.zzxy + -ImageAdjustments2.z;
@@ -255,7 +270,30 @@ float4 RunTonemap(float4 v5, float4 v6)
 
    if (LumaSettings.DisplayMode == 1) // HDR
    {
-      float3 recovered = sdr_lin / max(tm, 1e-6); // exact inverse of the pre-grade compression -> HDR range (linear BT.709)
+      const float inv_tm = rcp(max(tm, 1e-6));
+      float3 recovered = sdr_lin * inv_tm; // exact inverse of the pre-grade compression -> HDR range (linear BT.709)
+
+      // Color Grade Strength: 1 = full vanilla grade+LUT, 0 = bypass ImageAdjustments/LUT while retaining vignette.
+      recovered = lerp(ungraded_vignetted * inv_tm, recovered,
+                       saturate(LumaSettings.GameSettings.ColorGradeStrength));
+
+      // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
+      // Applied BEFORE the display mapping so DICE bounds the result to peak; graded after it, Contrast/Saturation
+      // could push past the display peak and hard-clip on screen.
+      // user Saturation: OkLCh chroma scale (hue + lightness intact; 1 = vanilla).
+      if (LumaSettings.GameSettings.Saturation != 1.0)
+      {
+         float3 lch = Oklab::linear_srgb_to_oklch(recovered);
+         lch.y *= LumaSettings.GameSettings.Saturation;
+         recovered = Oklab::oklch_to_linear_srgb(lch);
+      }
+      // user Contrast: luminance-preserving pow around 18% mid-gray (strictly positive -> no black crush).
+      if (LumaSettings.GameSettings.Contrast != 1.0)
+      {
+         float lum = GetLuminance(recovered);
+         if (lum > 0.0)
+            recovered *= pow(lum / MidGray, LumaSettings.GameSettings.Contrast) * MidGray / lum;
+      }
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance preserves hue; the
       // *_CORRECT_CHANNELS_BEYOND_PEAK_WHITE type additionally gamut-maps any single channel that rides past peak
@@ -264,11 +302,16 @@ float4 RunTonemap(float4 v5, float4 v6)
       // directly: do NOT round-trip primaries by hand. (With type 1 the manual 709<->2020 cancelled because the
       // luminance compress is a pure scalar; the corrected type's per-channel gamut map breaks that cancellation.)
       DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+      // Never start the shoulder below paper white: the 1/3-of-peak default dips into the SDR range whenever
+      // paperWhite > peakWhite/3 (high paper whites, or low-peak displays), dimming vanilla-range content
+      // (e.g. paper 203 / peak 203 rendered SDR white at ~153 nits). Capped below 1 so peak == paper white
+      // stays finite (degenerates to a clip at peak instead of a 0-width shoulder).
+      settings.ShoulderStart = max(settings.ShoulderStart, min(paperWhite / peakWhite, 0.98));
       float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;
 
-      // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
       // Highlight desaturation: bright sources fade toward white as luminance approaches peak (eye/sensor
-      // saturation). exponent in [1,0.05] keeps mid-tones colored; only luminance->peak whitens.
+      // saturation). exponent in [1,0.05] keeps mid-tones colored; only luminance->peak whitens. Stays POST-DICE
+      // (peak-relative by definition; a lerp toward luminance can never exceed peak, so it is bounded-safe).
       const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
       if (highlightDechroma > 0.0)
       {
@@ -276,10 +319,6 @@ float4 RunTonemap(float4 v5, float4 v6)
          float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
          hdr = Saturation(hdr, 1.0 - dcWeight);
       }
-      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation); // user Saturation (Oklab; 1 = vanilla)
-      // user Contrast: slope around 18% mid-gray (linear, 1.0 = paper white). Excursions caught by the NaN/clamp tail.
-      const float midGray = 0.18;
-      hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
 
       postProcessedColor = hdr;
    }

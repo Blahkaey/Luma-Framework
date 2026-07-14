@@ -475,6 +475,11 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS DoF Gaussian Blur CS"),
          ShaderDefinition{"Luma_BL2TPS_DoFGaussian", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "dof_blur_cs"});
 
+      // Pre-LUT max-channel compression curve for the HDR tonemap (see Luma_BL2TPS_Tonemap.hlsl).
+      shader_defines_data.append_range(std::vector<ShaderDefineData>{
+         {"TONEMAP_COMPRESSION_TYPE", '1', true, false, "Pre-LUT HDR compression curve\n0 - Reinhard (midgray-pinned, legacy)\n1 - Neutwo (default)\n2 - Identity below 0.5 + shoulder", 2},
+      });
+
       // XeGTAO
       shader_defines_data.append_range(std::vector<ShaderDefineData>{
          {"XE_GTAO_QUALITY", '2', true, false, "0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
@@ -493,12 +498,13 @@ public:
       luma_data_cbuffer_index = 12;
 
       // User HDR grade controls (read in Tonemap_0xD00AA2A7.ps_5_0.hlsl via LumaSettings.GameSettings). All
-      // default to a vanilla no-op. Exposure/Bloom/Vignette act on both SDR+HDR; Saturation/Dechroma/Contrast HDR-only.
+      // default to a vanilla no-op. Exposure/Bloom/Vignette act on both SDR+HDR;
+      // Saturation/Dechroma/Contrast/GradeStrength HDR-only.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
-      default_luma_global_game_settings.Saturation = 1.f;         // Oklab saturation
+      default_luma_global_game_settings.Saturation = 1.f;         // OkLCh chroma scale
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
       default_luma_global_game_settings.BloomIntensity = 1.f;     // Luma HDR bloom strength (additive)
-      default_luma_global_game_settings.Contrast = 1.f;           // slope around 18% mid-gray
+      default_luma_global_game_settings.Contrast = 1.f;           // pow around 18% mid-gray
       default_luma_global_game_settings.VignetteIntensity = 1.f;  // game vignette darkening scale
       default_luma_global_game_settings.LumaBloomEnable = 1.f;    // 1 = Luma HDR pyramidal bloom, 0 = vanilla game bloom
       default_luma_global_game_settings.DOFRadius = 9.f;          // DoF strength (px @ 4K); = vanilla DoF peak (sigma ~1.98 half-res px)
@@ -506,6 +512,7 @@ public:
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR), anti-banding on
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink videos (HDR only)
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // highlight-expansion strength (peak ~165 nits at 0.5)
+      default_luma_global_game_settings.ColorGradeStrength = 1.f; // full vanilla grade+LUT (0 = ungraded HDR scene)
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -1274,6 +1281,7 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "BloomIntensity", gs.BloomIntensity);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VignetteIntensity", gs.VignetteIntensity);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "ColorGradeStrength", gs.ColorGradeStrength);
 
       g_dof_type = 0; // default = vanilla game DoF
       reshade::get_config_value(nullptr, PROJECT_NAME, "DOFType", g_dof_type);
@@ -1314,7 +1322,7 @@ public:
       ImGui::EndDisabled();
 
       // --- HDR grade (read in Tonemap_0xD00AA2A7.ps_5_0.hlsl via LumaSettings.GameSettings). All vanilla by default.
-      // Exposure/Bloom/Vignette act on SDR+HDR; Saturation/Highlights/Contrast on the HDR display path only. ---
+      // Exposure/Bloom/Vignette act on SDR+HDR; Saturation/Highlights/Contrast/GradeStrength on the HDR display path only. ---
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& gd_def = default_luma_global_game_settings;
@@ -1331,12 +1339,24 @@ public:
          reshade::set_config_value(nullptr, PROJECT_NAME, "Exposure", gs.Exposure);
       }
 
+      if (ImGui::SliderFloat("Color Grade Strength", &gs.ColorGradeStrength, 0.f, 1.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, PROJECT_NAME, "ColorGradeStrength", gs.ColorGradeStrength);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("How much of the game's color grading (per-map LUT tint) applies in HDR (1 = vanilla, 0 = ungraded).");
+      if (DrawResetButton<float, false>(gs.ColorGradeStrength, gd_def.ColorGradeStrength, "ColorGradeStrength"))
+      {
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, PROJECT_NAME, "ColorGradeStrength", gs.ColorGradeStrength);
+      }
+
       if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Slope contrast around 18% mid-gray, HDR only (1 = vanilla).");
+         ImGui::SetTooltip("Contrast around 18% mid-gray, HDR only (1 = vanilla).");
       if (DrawResetButton<float, false>(gs.Contrast, gd_def.Contrast, "Contrast"))
       {
          device_data.cb_luma_global_settings_dirty = true;
